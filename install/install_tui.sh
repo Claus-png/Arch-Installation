@@ -3,130 +3,96 @@
 # TOOL_DESC: TUI-установщик Arch Linux — Teddy (i5-12400F · RTX 3050 · btrfs)
 # TOOL_MODE: gui
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# РЕЖИМЫ запуска:
-#   bash install_tui.sh           — главное меню
-#   bash install_tui.sh --post    — этап 2 после перезагрузки
-#
-# Внутренние (вызываются автоматически):
-#   --chroot       — настройка в chroot (с бэкапом)
-#   --chroot-fresh — настройка в chroot (без бэкапа)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+set -u -o pipefail
 
-set -euo pipefail
+DRY_RUN=0
+if [[ "${1:-}" == "--dry-run" ]]; then
+    DRY_RUN=1
+    shift
+fi
 
-MODE="${1:-menu}"
+MODE="${1:-wizard}"
 [[ "$MODE" == "--post" ]]          && MODE="post"
 [[ "$MODE" == "--chroot" ]]        && MODE="chroot"
 [[ "$MODE" == "--chroot-fresh" ]]  && MODE="chroot_fresh"
+[[ "$MODE" == "--oobe" ]]          && MODE="oobe"
 
-# ──────────────────────────────────────────────────────────────
-# СЛУЖЕБНЫЕ ФУНКЦИИ
-# ──────────────────────────────────────────────────────────────
-LOG_FILE="/tmp/install_tui_$(date +%Y%m%d_%H%M).log"
-_log()  { echo "[$(date +%H:%M:%S)] $*" >> "$LOG_FILE"; }
-_die()  { whiptail --title "КРИТИЧЕСКАЯ ОШИБКА" --msgbox "$*\n\nЛог: $LOG_FILE" 12 72; exit 1; }
-_msg()  { whiptail --title "Teddy Installer" --msgbox "$*" 12 72; }
-_info() { whiptail --title "Teddy Installer" --infobox "$*" 7 72; sleep 1; }
-_input() {
-    local title="$1" prompt="$2" default="${3:-}"
-    whiptail --title "$title" --inputbox "$prompt" 10 72 "$default" 3>&1 1>&2 2>&3
-}
-_step() {
-    local pct="$1" msg="$2"
-    echo "$pct"
-    printf 'XXX\n%s\nXXX\n' "$msg"
-    _log "$pct% — $msg"
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="${LOG_FILE:-/var/log/install.log}"
+PROFILE_FILE="${PROFILE_FILE:-$SCRIPT_DIR/../config/profile.conf}"
+DEFAULTS_FILE="${DEFAULTS_FILE:-$SCRIPT_DIR/../config/defaults.conf}"
+source "$SCRIPT_DIR/lib/ui.sh"
+source "$SCRIPT_DIR/lib/system.sh"
+source "$SCRIPT_DIR/lib/disk.sh"
+source "$SCRIPT_DIR/lib/packages.sh"
+for stage in "$SCRIPT_DIR/../stages"/*.sh; do
+    source "$stage"
+ done
+source "$SCRIPT_DIR/../post/oobe.sh"
 
-# ──────────────────────────────────────────────────────────────
-# ОБЩИЙ БЛОК: РАЗМЕТКА ДИСКА (переиспользуется в live и fresh)
-# ──────────────────────────────────────────────────────────────
-_partition_disk() {
-    local disk="$1" part_efi="$2" part_root="$3"
+mkdir -p "$(dirname "$LOG_FILE")"
+ensure_state_dir
+init_progress_pipe
+trap '_cleanup' EXIT
+trap 'exit 1' INT TERM
+_load_defaults
+load_profile
+apply_defaults
 
-    _step 5 "GPT разметка: $disk..."
-    sgdisk --zap-all "$disk" >>"$LOG_FILE" 2>&1
-    sgdisk -n 1:0:+1G  -t 1:EF00 -c 1:"EFI System"  "$disk" >>"$LOG_FILE" 2>&1
-    sgdisk -n 2:0:0    -t 2:8300 -c 2:"Linux btrfs"  "$disk" >>"$LOG_FILE" 2>&1
-    sleep 2; partprobe "$disk" 2>/dev/null || true; sleep 1
+wizard_run() {
+    local current=1
+    local action="next"
+    local autopilot=0
 
-    [ -b "$part_efi" ]  || { echo "ERROR: $part_efi не создан"; exit 1; }
-    [ -b "$part_root" ] || { echo "ERROR: $part_root не создан"; exit 1; }
+    if [[ -n "${DISK:-}" && -n "${USERNAME:-}" ]]; then
+        autopilot=1
+    fi
 
-    _step 10 "Форматирование: FAT32 (EFI) + btrfs (ROOT)..."
-    mkfs.fat -F32 -n EFI "$part_efi" >>"$LOG_FILE" 2>&1
-    mkfs.btrfs -L ARCH -f "$part_root" >>"$LOG_FILE" 2>&1
+    start_progress_bar "Wizard" "Preparing installer"
+    progress_update 5
 
-    _step 14 "btrfs субтома (@, @home, @log, @cache, @snapshots)..."
-    local BOPTS="noatime,compress=zstd:3,space_cache=v2,discard=async"
-    mount "$part_root" /mnt
-    for sv in @ @home @log @cache @snapshots; do
-        btrfs subvolume create "/mnt/$sv" >>"$LOG_FILE" 2>&1
+    if [[ "$autopilot" -eq 1 ]]; then
+        stage_01_welcome >/dev/null 2>&1 || true
+        stage_02_preflight >/dev/null 2>&1 || true
+        stage_03_disk_setup >/dev/null 2>&1 || true
+        stage_04_user_config >/dev/null 2>&1 || true
+        stage_05_packages >/dev/null 2>&1 || true
+        if stage_06_summary; then
+            return 0
+        fi
+        return 1
+    fi
+
+    while true; do
+        case "$current" in
+            1) stage_01_welcome ;;
+            2) stage_02_preflight ;;
+            3) stage_03_disk_setup ;;
+            4) stage_04_user_config ;;
+            5) stage_05_packages ;;
+            6) if stage_06_summary; then
+                   return 0
+               fi
+               current=5
+               continue
+               ;;
+        esac
+
+        action=$(whiptail --title "Navigation" --menu "Back / Next" 10 72 2 \
+            "back" "Back" \
+            "next" "Next" 3>&1 1>&2 2>&3) || return 1
+
+        case "$action" in
+            back)
+                ((current--))
+                [[ "$current" -lt 1 ]] && current=1
+                ;;
+            next)
+                ((current++))
+                [[ "$current" -gt 6 ]] && current=6
+                ;;
+        esac
     done
-    umount /mnt
-
-    _step 18 "Монтирование файловой системы..."
-    mount -o "${BOPTS},subvol=@"          "$part_root" /mnt
-    mkdir -p /mnt/{boot,home,var/log,var/cache,snapshots}
-    mount -o "${BOPTS},subvol=@home"      "$part_root" /mnt/home
-    mount -o "${BOPTS},subvol=@log"       "$part_root" /mnt/var/log
-    mount -o "${BOPTS},subvol=@cache"     "$part_root" /mnt/var/cache
-    mount -o "${BOPTS},subvol=@snapshots" "$part_root" /mnt/snapshots
-    mount "$part_efi" /mnt/boot
-}
-
-# ──────────────────────────────────────────────────────────────
-# ОБЩИЙ БЛОК: ВЫБОР ЦЕЛЕВОГО ДИСКА (с защитой)
-# ──────────────────────────────────────────────────────────────
-_select_target_disk() {
-    # Строим список всех ДИСКОВ (не разделов)
-    local DISK_LIST=()
-    while IFS= read -r line; do
-        local NAME SIZE MODEL
-        NAME=$(echo "$line" | awk '{print $1}')
-        SIZE=$(echo "$line" | awk '{print $2}')
-        MODEL=$(echo "$line" | awk '{$1=$2=""; print $0}' | xargs)
-        DISK_LIST+=("/dev/$NAME" "${SIZE} — ${MODEL:-без модели}")
-    done < <(lsblk -dno NAME,SIZE,MODEL | grep -v loop)
-
-    local CHOSEN
-    CHOSEN=$(whiptail --title "⚠  Выбор диска для УСТАНОВКИ  ⚠" \
-        --menu \
-        "Выбери диск для Arch Linux.\n\n!! ВСЕ ДАННЫЕ НА НЁМ БУДУТ УНИЧТОЖЕНЫ !!\n\nТвой SSD ~465ГБ. НЕ выбирай HDD 3.7ТБ и КИРИЛЛ 931ГБ!" \
-        18 74 8 "${DISK_LIST[@]}" \
-        3>&1 1>&2 2>&3) || _die "Установка отменена."
-
-    local DGB MODEL_C SERIAL PARTS
-    DGB=$(( $(lsblk -bno SIZE "$CHOSEN" | head -1) / 1024 / 1024 / 1024 ))
-    MODEL_C=$(lsblk -no MODEL "$CHOSEN" 2>/dev/null | head -1 | xargs || echo "—")
-    SERIAL=$(udevadm info "$CHOSEN" 2>/dev/null | grep "ID_SERIAL=" | head -1 | cut -d= -f2 || echo "—")
-    PARTS=$(lsblk "$CHOSEN" 2>/dev/null | tail -n +2 | head -6 || echo "  —")
-
-    # Первое подтверждение
-    whiptail --title "!! НЕОБРАТИМОЕ ДЕЙСТВИЕ !!" --yesno \
-"БУДЕТ УНИЧТОЖЕНО:\n
-  Диск:    $CHOSEN
-  Размер:  ${DGB}ГБ
-  Модель:  $MODEL_C
-  S/N:     $SERIAL\n
-Разделы:
-$PARTS\n
-Windows и все данные исчезнут НАВСЕГДА.\nТы точно выбрал правильный диск?" \
-    22 72 || _die "Отменено."
-
-    # Второе: ввод имени вручную
-    local CONFIRM
-    CONFIRM=$(whiptail --title "Финальное подтверждение" \
-        --inputbox \
-        "Введи имя диска вручную:\n(например: /dev/nvme0n1 или /dev/sda)\n\n  Выбранный диск: $CHOSEN" \
-        12 72 "" \
-        3>&1 1>&2 2>&3) || _die "Отменено."
-
-    [ "$CONFIRM" != "$CHOSEN" ] && \
-        _die "Диски не совпадают ($CONFIRM ≠ $CHOSEN).\nОтменено."
-
-    echo "$CHOSEN"
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -150,6 +116,11 @@ MIRRORS
 # ОБЩИЙ БЛОК: CHROOT BASE CONFIG (locale, hostname, user, boot)
 # ──────────────────────────────────────────────────────────────
 _chroot_base_config() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        _log "[dry-run] chroot base config skipped"
+        return 0
+    fi
+
     # Вызывается уже внутри chroot, переменные из install_vars.env
     source /root/install_vars.env
 
@@ -237,6 +208,11 @@ EOF
 # ОБЩИЙ БЛОК: ВОССТАНОВЛЕНИЕ БЭКАПА В CHROOT
 # ──────────────────────────────────────────────────────────────
 _restore_backup_in_chroot() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        _log "[dry-run] backup restore skipped"
+        return 0
+    fi
+
     source /root/install_vars.env
 
     # Монтируем по UUID (не /dev/sdX — надёжнее!)
@@ -425,8 +401,22 @@ GPGSCRIPT
 }
 
 # ══════════════════════════════════════════════════════════════
-# ██████████  ГЛАВНОЕ МЕНЮ  ██████████
+# ██████████  WIZARD / OOBE  ██████████
+# ══════════════════════════════════════════════════════
+if [[ "$MODE" == "wizard" ]]; then
+    wizard_run || exit 1
+    stage_07_install
+    exit 0
+fi
+
+if [[ "$MODE" == "oobe" ]]; then
+    run_oobe
+    exit 0
+fi
+
 # ══════════════════════════════════════════════════════════════
+# ██████████  ГЛАВНОЕ МЕНЮ  ██████████
+# ══════════════════════════════════════════════════════
 if [[ "$MODE" == "menu" ]]; then
 
 command -v whiptail &>/dev/null || pacman -Sy --noconfirm libnewt 2>/dev/null
@@ -576,11 +566,8 @@ fi  # END clone
 if [[ "$MODE" == "live" ]]; then
 
 command -v whiptail &>/dev/null || pacman -Sy --noconfirm libnewt 2>/dev/null
-[ ! -d /sys/firmware/efi/efivars ] && _die "BIOS-режим! Нужен UEFI."
-ping -c 1 -W 5 archlinux.org &>/dev/null || _die "Нет интернета!"
-
+preflight_checks
 _set_ru_mirrors
-timedatectl set-ntp true
 
 whiptail --title "Установка Arch с бэкапом" --msgbox \
 "Пакеты будут взяты из бэкапа (pkglist_repo.txt + pkglist_aur.txt),\nа не из хардкодного списка!\n\nKDE, kitty, fastfetch, сессии — всё восстановится\nавтоматически в chroot до первого входа." \
@@ -591,10 +578,16 @@ USERNAME=$(_input "Пользователь" "Имя пользователя:" 
 HOSTNAME=$(_input "Hostname" "Имя компьютера:" "archbox") || _die "Отменено."
 
 TARGET_DISK=$(_select_target_disk)
+validate_disk_path "$TARGET_DISK" || _die "Некорректный диск: $TARGET_DISK"
 if [[ "$TARGET_DISK" =~ nvme[0-9]+n[0-9]+$ ]] || [[ "$TARGET_DISK" =~ mmcblk ]]; then
     PART_EFI="${TARGET_DISK}p1"; PART_ROOT="${TARGET_DISK}p2"
 else
     PART_EFI="${TARGET_DISK}1"; PART_ROOT="${TARGET_DISK}2"
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    _msg "Dry run: планирование завершено, изменения не применялись."
+    exit 0
 fi
 
 # ── Выбор бэкап-раздела (вручную, с меню!) ────────────────────
@@ -613,6 +606,7 @@ BACKUP_DISK=$(whiptail --title "Раздел с бэкапом (КИРИЛЛ)" \
     "Выбери раздел с бэкапом.\n(КИРИЛЛ — обычно FAT32/NTFS ~931ГБ)" \
     18 74 10 "${BK_LIST[@]}" \
     3>&1 1>&2 2>&3) || BACKUP_DISK="Пропустить"
+validate_backup_device "$BACKUP_DISK" || _die "Некорректный раздел бэкапа: $BACKUP_DISK"
 
 # Сохраняем UUID, не /dev/sdX!
 BACKUP_UUID="Пропустить"
@@ -634,26 +628,28 @@ _log "Диск: $TARGET_DISK, Пользователь: $USERNAME, Хост: $HO
 _log "Бэкап UUID: $BACKUP_UUID, Path: $BACKUP_SUBPATH"
 
 {
-_step 2 "NTP..."
-timedatectl set-ntp true 2>>"$LOG_FILE" || true
+    exec 3>&1
+    exec 1>>"$LOG_FILE" 2>&1
 
-_partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT"
+    _step 2 "Синхронизация времени..."
+    timedatectl set-ntp true || true
 
-_step 22 "pacstrap (~600МБ, 5–15 мин)..."
-pacstrap -K /mnt \
-    base base-devel linux linux-headers linux-lts linux-firmware \
-    btrfs-progs intel-ucode efibootmgr \
-    networkmanager nano vim sudo \
-    zsh git curl wget htop rsync \
-    man-db man-pages openssh bash-completion whiptail \
-    >>"$LOG_FILE" 2>&1
+    run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT"
 
-_step 48 "fstab..."
-genfstab -U /mnt >> /mnt/etc/fstab
+    _step 22 "pacstrap (~600МБ, 5–15 мин)..."
+    pacstrap -K /mnt \
+        base base-devel linux linux-headers linux-lts linux-firmware \
+        btrfs-progs intel-ucode efibootmgr \
+        networkmanager nano vim sudo \
+        zsh git curl wget htop rsync \
+        man-db man-pages openssh bash-completion whiptail
 
-_step 52 "Переменные для chroot..."
-ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
-cat > /mnt/root/install_vars.env << ENVEOF
+    _step 48 "Генерация fstab..."
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+    _step 52 "Подготовка chroot..."
+    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    cat > /mnt/root/install_vars.env << ENVEOF
 USERNAME="$USERNAME"
 HOSTNAME="$HOSTNAME"
 ROOT_UUID="$ROOT_UUID"
@@ -662,15 +658,15 @@ PART_ROOT="$PART_ROOT"
 BACKUP_UUID="$BACKUP_UUID"
 BACKUP_SUBPATH="$BACKUP_SUBPATH"
 ENVEOF
-cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
-cp "$0" /mnt/root/install_tui.sh
-chmod +x /mnt/root/install_tui.sh
+    cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
+    cp "$0" /mnt/root/install_tui.sh
+    chmod +x /mnt/root/install_tui.sh
 
-_step 55 "chroot: настройка системы + восстановление бэкапа..."
-arch-chroot /mnt /bin/bash /root/install_tui.sh --chroot >>"$LOG_FILE" 2>&1
+    _step 55 "chroot: настройка системы + восстановление бэкапа..."
+    arch-chroot /mnt /bin/bash /root/install_tui.sh --chroot
 
-_step 100 "Готово!"
-sleep 1
+    _step 100 "Готово!"
+    sleep 1
 
 } | whiptail --title "Установка Arch Linux с бэкапом..." \
     --gauge "Инициализация..." 8 74 0
@@ -702,11 +698,8 @@ fi
 if [[ "$MODE" == "fresh" ]]; then
 
 command -v whiptail &>/dev/null || pacman -Sy --noconfirm libnewt 2>/dev/null
-[ ! -d /sys/firmware/efi/efivars ] && _die "BIOS-режим! Нужен UEFI."
-ping -c 1 -W 5 archlinux.org &>/dev/null || _die "Нет интернета!"
-
+preflight_checks
 _set_ru_mirrors
-timedatectl set-ntp true
 
 whiptail --title "Чистая установка Arch" --msgbox \
 "Arch + KDE Plasma + базовые пакеты.\nБез восстановления конфигов.\n\nКонфиги KDE, kitty, fastfetch — дефолтные.\nВосстановить бэкап можно потом через backup_tui.sh." \
@@ -717,36 +710,44 @@ USERNAME=$(_input "Пользователь" "Имя пользователя:" 
 HOSTNAME=$(_input "Hostname" "Имя компьютера:" "archbox") || _die "Отменено."
 
 TARGET_DISK=$(_select_target_disk)
+validate_disk_path "$TARGET_DISK" || _die "Некорректный диск: $TARGET_DISK"
 if [[ "$TARGET_DISK" =~ nvme[0-9]+n[0-9]+$ ]] || [[ "$TARGET_DISK" =~ mmcblk ]]; then
     PART_EFI="${TARGET_DISK}p1"; PART_ROOT="${TARGET_DISK}p2"
 else
     PART_EFI="${TARGET_DISK}1"; PART_ROOT="${TARGET_DISK}2"
 fi
 
+if [[ "$DRY_RUN" == "1" ]]; then
+    _msg "Dry run: планирование завершено, изменения не применялись."
+    exit 0
+fi
+
 _log "=== Чистая установка ==="
 _log "Диск: $TARGET_DISK, Пользователь: $USERNAME, Хост: $HOSTNAME"
 
 {
-_step 2 "NTP..."
-timedatectl set-ntp true 2>>"$LOG_FILE" || true
+    exec 3>&1
+    exec 1>>"$LOG_FILE" 2>&1
 
-_partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT"
+    _step 2 "Синхронизация времени..."
+    timedatectl set-ntp true || true
 
-_step 22 "pacstrap..."
-pacstrap -K /mnt \
-    base base-devel linux linux-headers linux-lts linux-firmware \
-    btrfs-progs intel-ucode efibootmgr \
-    networkmanager nano vim sudo \
-    zsh git curl wget htop rsync \
-    man-db man-pages openssh bash-completion whiptail \
-    >>"$LOG_FILE" 2>&1
+    run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT"
 
-_step 48 "fstab..."
-genfstab -U /mnt >> /mnt/etc/fstab
+    _step 22 "pacstrap..."
+    pacstrap -K /mnt \
+        base base-devel linux linux-headers linux-lts linux-firmware \
+        btrfs-progs intel-ucode efibootmgr \
+        networkmanager nano vim sudo \
+        zsh git curl wget htop rsync \
+        man-db man-pages openssh bash-completion whiptail
 
-_step 52 "Переменные для chroot..."
-ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
-cat > /mnt/root/install_vars.env << ENVEOF
+    _step 48 "Генерация fstab..."
+    genfstab -U /mnt >> /mnt/etc/fstab
+
+    _step 52 "Подготовка chroot..."
+    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    cat > /mnt/root/install_vars.env << ENVEOF
 USERNAME="$USERNAME"
 HOSTNAME="$HOSTNAME"
 ROOT_UUID="$ROOT_UUID"
@@ -755,15 +756,15 @@ PART_ROOT="$PART_ROOT"
 BACKUP_UUID="Пропустить"
 BACKUP_SUBPATH=""
 ENVEOF
-cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
-cp "$0" /mnt/root/install_tui.sh
-chmod +x /mnt/root/install_tui.sh
+    cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
+    cp "$0" /mnt/root/install_tui.sh
+    chmod +x /mnt/root/install_tui.sh
 
-_step 55 "chroot: настройка (без бэкапа)..."
-arch-chroot /mnt /bin/bash /root/install_tui.sh --chroot-fresh >>"$LOG_FILE" 2>&1
+    _step 55 "chroot: настройка (без бэкапа)..."
+    arch-chroot /mnt /bin/bash /root/install_tui.sh --chroot-fresh
 
-_step 100 "Готово!"
-sleep 1
+    _step 100 "Готово!"
+    sleep 1
 
 } | whiptail --title "Чистая установка..." --gauge "Инициализация..." 8 74 0
 
@@ -792,7 +793,15 @@ fi
 # ══════════════════════════════════════════════════════════════
 if [[ "$MODE" == "post" ]]; then
 
+if [[ "$DRY_RUN" == "1" ]]; then
+    _msg "Dry run: post-этап не выполнялся."
+    exit 0
+fi
+
 [ "$(id -u)" -eq 0 ] && _die "Запускай от обычного пользователя!"
+sudo -v || _die "Нужны права sudo для продолжения!"
+while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+SUDO_KEEP_PID=$!
 [ -f ~/install_vars.env ] && source ~/install_vars.env || true
 USERNAME=$(whoami)
 IS_BACKUP_INSTALL=false
@@ -811,21 +820,24 @@ fi)\n
 20 72
 
 {
-_step 2 "Обновление системы..."
-sudo pacman -Syu --noconfirm >>"$LOG_FILE" 2>&1
+    exec 3>&1
+    exec 1>>"$LOG_FILE" 2>&1
 
-_step 5 "multilib..."
-sudo sed -i '/^#\[multilib\]/{n;s/^#//};/^#\[multilib\]/s/^#//;' /etc/pacman.conf
-sudo sed -i 's/^#ParallelDownloads/ParallelDownloads/; s/^#Color/Color/' /etc/pacman.conf
-sudo pacman -Syu --noconfirm >>"$LOG_FILE" 2>&1
+    _step 2 "Обновление системы..."
+    sudo pacman -Syu --noconfirm
 
-_step 8 "paru..."
-if ! command -v paru &>/dev/null; then
-    sudo pacman -S --needed --noconfirm git base-devel >>"$LOG_FILE" 2>&1
-    git clone https://aur.archlinux.org/paru.git /tmp/paru_b >>"$LOG_FILE" 2>&1
-    cd /tmp/paru_b && makepkg -si --noconfirm >>"$LOG_FILE" 2>&1
-    cd ~ && rm -rf /tmp/paru_b
-fi
+    _step 5 "multilib..."
+    sudo sed -i '/^#\[multilib\]/{n;s/^#//};/^#\[multilib\]/s/^#//;' /etc/pacman.conf
+    sudo sed -i 's/^#ParallelDownloads/ParallelDownloads/; s/^#Color/Color/' /etc/pacman.conf
+    sudo pacman -Syu --noconfirm
+
+    _step 8 "paru..."
+    if ! command -v paru &>/dev/null; then
+        sudo pacman -S --needed --noconfirm git base-devel
+        git clone https://aur.archlinux.org/paru.git /tmp/paru_b
+        cd /tmp/paru_b && makepkg -si --noconfirm
+        cd ~ && rm -rf /tmp/paru_b
+    fi
 
 _step 12 "NVIDIA RTX 3050..."
 sudo pacman -S --needed --noconfirm \
@@ -1058,6 +1070,12 @@ whiptail --title "✓ УСТАНОВКА ЗАВЕРШЕНА!" --msgbox \
 24 72
 
 read -rp "Перезагрузиться сейчас? [y/N] " do_r
-[[ "$do_r" =~ ^[Yy]$ ]] && { _info "Перезагрузка..."; sleep 2; sudo reboot; }
+if [[ "$do_r" =~ ^[Yy]$ ]]; then
+    _info "Перезагрузка..."
+    sleep 2
+    sudo reboot
+else
+    _cleanup
+fi
 
 fi  # END post

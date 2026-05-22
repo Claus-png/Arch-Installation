@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+set -u -o pipefail
+
+DRY_RUN="${DRY_RUN:-0}"
+INSTALL_STATE_DIR="${INSTALL_STATE_DIR:-/tmp/install_state}"
+LOG_FILE="${LOG_FILE:-/var/log/install.log}"
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+DEFAULTS_FILE="${DEFAULTS_FILE:-$SCRIPT_DIR/../config/defaults.conf}"
+PROFILE_FILE="${PROFILE_FILE:-$SCRIPT_DIR/../config/profile.conf}"
+
+ensure_state_dir() {
+    mkdir -p "$INSTALL_STATE_DIR"
+}
+
+mark_step() {
+    local step="$1"
+    touch "$INSTALL_STATE_DIR/${step}.done"
+}
+
+step_done() {
+    local step="$1"
+    [[ -f "$INSTALL_STATE_DIR/${step}.done" ]]
+}
+
+stage_done() {
+    mark_step "$1"
+}
+
+stage_exists() {
+    step_done "$1"
+}
+
+run_stage() {
+    local stage="$1"
+    shift
+    if stage_exists "$stage"; then
+        _log "Stage ${stage}: already complete, skipping"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        _log "[dry-run] stage ${stage}: $*"
+        return 0
+    fi
+    "$@"
+    stage_done "$stage"
+}
+
+run_step() {
+    local step="$1"
+    shift
+    if step_done "$step"; then
+        _log "Step ${step}: already complete, skipping"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        _log "[dry-run] step ${step}: $*"
+        return 0
+    fi
+    "$@"
+    local code=$?
+    if [[ "$code" -eq 0 ]]; then
+        mark_step "$step"
+    fi
+    return "$code"
+}
+
+_load_defaults() {
+    if [[ -f "$DEFAULTS_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$DEFAULTS_FILE"
+        _log "Loaded defaults from $DEFAULTS_FILE"
+    fi
+}
+
+load_profile() {
+    if [[ -f "$PROFILE_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$PROFILE_FILE"
+        _log "Loaded profile from $PROFILE_FILE"
+    fi
+}
+
+apply_defaults() {
+    export USERNAME="${USERNAME:-${DEFAULT_USERNAME:-teddy}}"
+    export HOSTNAME="${HOSTNAME:-${DEFAULT_HOSTNAME:-archbox}}"
+    export USE_LUKS="${USE_LUKS:-${DEFAULT_USE_LUKS:-no}}"
+    export DISK="${DISK:-}"
+    export CPU_DRIVER="${CPU_DRIVER:-${DEFAULT_CPU_DRIVER:-auto}}"
+    export GPU_DRIVER="${GPU_DRIVER:-${DEFAULT_GPU_DRIVER:-auto}}"
+    export ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-0}"
+    export PACKAGE_LIST="${PACKAGE_LIST:-${DEFAULT_PACKAGE_LIST:-}}"
+    export LUKS_PASSWORD="${LUKS_PASSWORD:-}"
+}
+
+_detect_cpu() {
+    if grep -q "AuthenticAMD" /proc/cpuinfo; then
+        CPU_DRIVER="amd-ucode"
+    elif grep -q "GenuineIntel" /proc/cpuinfo; then
+        CPU_DRIVER="intel-ucode"
+    else
+        CPU_DRIVER="auto"
+    fi
+}
+
+_detect_gpu() {
+    local vendor
+    vendor=$(lspci 2>/dev/null | awk '/VGA|3D/ {print $0}' | head -1 || true)
+    if echo "$vendor" | grep -qi "NVIDIA"; then
+        GPU_DRIVER="nvidia-dkms"
+    elif echo "$vendor" | grep -qi "AMD"; then
+        GPU_DRIVER="amdgpu"
+    elif echo "$vendor" | grep -qi "Intel"; then
+        GPU_DRIVER="intel-media-driver"
+    else
+        GPU_DRIVER="auto"
+    fi
+}
+
+detect_hardware() {
+    _detect_cpu
+    _detect_gpu
+    local mem_kb
+    mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    ZRAM_SIZE_MB=$((mem_kb / 1024 / 2))
+    export CPU_DRIVER GPU_DRIVER ZRAM_SIZE_MB
+    _log "Hardware detected: CPU=$CPU_DRIVER GPU=$GPU_DRIVER ZRAM=${ZRAM_SIZE_MB}MiB"
+}
+
+_retry_or_die() {
+    local desc="$1"
+    shift
+    "$@"
+    local code=$?
+    if [[ "$code" -ne 0 ]]; then
+        if whiptail --yesno "Error: ${desc}\n\nExit code: ${code}\n\nRetry?" 10 60 3>&1 1>&2 2>&3; then
+            _retry_or_die "$desc" "$@"
+        else
+            _log "WARN: step skipped: ${desc}"
+            return "$code"
+        fi
+    fi
+    return 0
+}
+
+_try() {
+    _retry_or_die "$1" "$@"
+}
+
+run_cmd() {
+    local description="$1"
+    shift
+    if [[ "$DRY_RUN" == "1" ]]; then
+        _log "[dry-run] ${description}: $*"
+        return 0
+    fi
+    _log "RUN: ${description}"
+    _try "$description" "$@"
+}
+
+configure_mkinitcpio() {
+    local target_root="$1"
+    local use_luks="$2"
+    local gpu_driver="$3"
+
+    if [[ "$use_luks" == "yes" ]]; then
+        sed -i 's/^HOOKS=(\(.*\)block \(.*\))/HOOKS=(\1block encrypt \2)/' "$target_root/etc/mkinitcpio.conf"
+    fi
+
+    if [[ "$gpu_driver" == "nvidia-dkms" ]]; then
+        sed -i 's/^MODULES=(.*)$/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' "$target_root/etc/mkinitcpio.conf"
+    fi
+
+    arch-chroot "$target_root" mkinitcpio -P >> "$LOG_FILE" 2>&1
+}
+
+configure_zram() {
+    local target_root="$1"
+    mkdir -p "$target_root/etc/systemd"
+    cat > "$target_root/etc/systemd/zram-generator.conf" <<EOF
+[zram0]
+zram-size = ${ZRAM_SIZE_MB}
+compression-algorithm = zstd
+EOF
+}
+
+validate_disk_path() {
+    local disk="$1"
+    [[ "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+)$ ]]
+}
+
+validate_backup_device() {
+    local disk="$1"
+    [[ "$disk" == "Пропустить" || "$disk" == "Восстановить вручную после перезагрузки" || "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+)$ ]]
+}
+
+stage_text() {
+    local current="$1"
+    local total="$2"
+    local msg="$3"
+    printf 'Stage %s of %s: %s' "$current" "$total" "$msg"
+}
+
+preflight_checks() {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        _log "[dry-run] preflight checks skipped"
+        return 0
+    fi
+
+    [ -d /sys/firmware/efi/efivars ] || _die "BIOS-режим! Нужен UEFI."
+    timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || _die "Не удалось синхронизировать время"
+    ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1 || _die "Нет интернет-соединения"
+
+    local mem_gb
+    mem_gb=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo)
+    [[ "$mem_gb" -ge 2 ]] || _die "Недостаточно RAM: требуется >= 2 GB, найдено ${mem_gb} GB"
+
+    detect_hardware
+    init_progress_pipe
+    progress_reset
+    _log "Preflight checks passed"
+}

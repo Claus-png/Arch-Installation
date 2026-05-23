@@ -4,9 +4,11 @@ set -u -o pipefail
 
 LOG_FILE="${LOG_FILE:-/var/log/install.log}"
 PROGRESS_PIPE="${PROGRESS_PIPE:-/tmp/progress_pipe}"
+PROGRESS_STATE_FILE="${PROGRESS_STATE_FILE:-/tmp/progress_state}"
 PROGRESS_FD="${PROGRESS_FD:-3}"
 PROGRESS_BAR_PID=""
-NEWT_COLORS="${NEWT_COLORS:-root=,black roottext=,black title=,black checkbox=,blue button=,cyan}"
+NEWT_COLORS="${NEWT_COLORS:-root=,black roottext=,white title=,white checkbox=,cyan button=,cyan}"
+INSTALL_BRAND="Teddy Installer"
 export NEWT_COLORS
 
 _cleanup() {
@@ -28,12 +30,29 @@ _die() {
 }
 
 _msg() {
-    whiptail --title "Teddy Installer" --msgbox "$*" 12 72
+    whiptail --title "$INSTALL_BRAND" --msgbox "$*" 12 72
 }
 
 _info() {
-    whiptail --title "Teddy Installer" --infobox "$*" 7 72
+    whiptail --title "$INSTALL_BRAND" --infobox "$*" 7 72
     sleep 1
+}
+
+show_header() {
+    local title="$1"
+    local body="$2"
+    whiptail --title "$title" --msgbox "$body" 12 74
+}
+
+ask_yes_no() {
+    whiptail --yesno "$1" 10 74
+}
+
+ask_menu() {
+    local title="$1"
+    local prompt="$2"
+    shift 2
+    whiptail --title "$title" --menu "$prompt" 14 74 8 "$@" 3>&1 1>&2 2>&3
 }
 
 _input() {
@@ -59,38 +78,53 @@ _step() {
 
 init_progress_pipe() {
     rm -f "$PROGRESS_PIPE"
-    mkfifo "$PROGRESS_PIPE"
-    exec {PROGRESS_FD}> "$PROGRESS_PIPE"
-    progress_reset
+    : > "$PROGRESS_STATE_FILE"
+    PROGRESS_FD=""
 }
 
 start_progress_bar() {
     local title="$1"
     local body="${2:-Инициализация...}"
-    (
-        while IFS= read -r value; do
+
+    finish_progress_bar >/dev/null 2>&1 || true
+    coproc PROGRESS_COPROC {
+        while IFS= read -r value || [[ -n "$value" ]]; do
             [[ -n "$value" ]] || continue
             printf 'XXX\n%s\nXXX\n' "$value"
-        done < "$PROGRESS_PIPE"
-    ) | whiptail --title "$title" --gauge "$body" 8 74 0 &
+        done
+    }
+    whiptail --title "$title" --gauge "$body" 8 74 0 <&"${PROGRESS_COPROC[0]}" &
     PROGRESS_BAR_PID=$!
+    exec {PROGRESS_FD}>&"${PROGRESS_COPROC[1]}"
+    progress_reset
 }
 
 finish_progress_bar() {
+    if [[ -n "${PROGRESS_FD:-}" ]]; then
+        eval "exec ${PROGRESS_FD}>&-"
+        PROGRESS_FD=""
+    fi
     if [[ -n "$PROGRESS_BAR_PID" ]]; then
-        exec {PROGRESS_FD}>&-
         wait "$PROGRESS_BAR_PID" 2>/dev/null || true
         PROGRESS_BAR_PID=""
     fi
 }
 
 progress_reset() {
-    echo "0" >&"$PROGRESS_FD" 2>/dev/null || true
+    if [[ -n "${PROGRESS_FD:-}" ]]; then
+        printf '0\n' >&"$PROGRESS_FD"
+    else
+        printf '0\n' > "$PROGRESS_STATE_FILE"
+    fi
 }
 
 progress_update() {
     local pct="$1"
-    echo "$pct" >&"$PROGRESS_FD" 2>/dev/null || true
+    if [[ -n "${PROGRESS_FD:-}" ]]; then
+        printf '%s\n' "$pct" >&"$PROGRESS_FD"
+    else
+        printf '%s\n' "$pct" > "$PROGRESS_STATE_FILE"
+    fi
 }
 
 show_log() {

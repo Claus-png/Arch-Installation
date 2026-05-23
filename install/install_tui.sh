@@ -3,7 +3,7 @@
 # TOOL_DESC: TUI-установщик Arch Linux — Teddy (i5-12400F · RTX 3050 · btrfs)
 # TOOL_MODE: gui
 
-set -u -o pipefail
+set -eEuo pipefail
 
 DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -18,33 +18,66 @@ MODE="${1:-wizard}"
 [[ "$MODE" == "--oobe" ]]          && MODE="oobe"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d /root/install/lib ]]; then
+    SCRIPT_DIR="/root/install"
+fi
+if [[ ! -f "$SCRIPT_DIR/lib/ui.sh" && -d "$HOME/install/lib" ]]; then
+    SCRIPT_DIR="$HOME/install"
+fi
+STAGE_DIR="$SCRIPT_DIR/stages"
+POST_DIR="$SCRIPT_DIR/post"
 LOG_FILE="${LOG_FILE:-/var/log/install.log}"
 PROFILE_FILE="${PROFILE_FILE:-$SCRIPT_DIR/../config/profile.conf}"
 DEFAULTS_FILE="${DEFAULTS_FILE:-$SCRIPT_DIR/../config/defaults.conf}"
+if [[ ! -f "$PROFILE_FILE" && -f "/root/config/profile.conf" ]]; then
+    PROFILE_FILE="/root/config/profile.conf"
+fi
+if [[ ! -f "$DEFAULTS_FILE" && -f "/root/config/defaults.conf" ]]; then
+    DEFAULTS_FILE="/root/config/defaults.conf"
+fi
 source "$SCRIPT_DIR/lib/ui.sh"
 source "$SCRIPT_DIR/lib/system.sh"
 source "$SCRIPT_DIR/lib/disk.sh"
 source "$SCRIPT_DIR/lib/packages.sh"
-for stage in "$SCRIPT_DIR/../stages"/*.sh; do
+for stage in "$STAGE_DIR"/*.sh; do
     source "$stage"
- done
-source "$SCRIPT_DIR/../post/oobe.sh"
+done
+source "$POST_DIR/oobe.sh"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 ensure_state_dir
+reset_install_state
 init_progress_pipe
 trap '_cleanup' EXIT
+trap '_on_error $LINENO "$BASH_COMMAND"' ERR
 trap 'exit 1' INT TERM
 _load_defaults
 load_profile
 apply_defaults
+
+ensure_runtime_package() {
+    local pkg="$1"
+    if command -v "$pkg" &>/dev/null; then
+        return 0
+    fi
+    if pacman -S --needed --noconfirm "$pkg" >/dev/null 2>&1; then
+        return 0
+    fi
+    _die "Не удалось установить $pkg"
+}
+
+_on_error() {
+    local line="$1"
+    local command="$2"
+    _die "Ошибка в строке $line: $command"
+}
 
 wizard_run() {
     local current=1
     local action="next"
     local autopilot=0
 
-    if [[ -n "${DISK:-}" && -n "${USERNAME:-}" ]]; then
+    if [[ "${AUTO_INSTALL:-0}" == "1" ]]; then
         autopilot=1
     fi
 
@@ -95,6 +128,23 @@ wizard_run() {
     done
 }
 
+finish_install_prompt() {
+    whiptail --title "Готово" --msgbox \
+"Установка завершена.\n\nРекомендуется перезагрузить систему, чтобы начать использовать новый Arch Linux.\n\nИспользуйте: reboot" 10 72
+}
+
+copy_runtime_to_chroot() {
+    local target_root="$1"
+    mkdir -p "$target_root/root"
+    rm -rf "$target_root/root/install" "$target_root/root/config"
+    mkdir -p "$target_root/root/install" "$target_root/root/config"
+    cp -a "$SCRIPT_DIR/." "$target_root/root/install/"
+    cp -a "$SCRIPT_DIR/../config/." "$target_root/root/config/"
+    if [[ -f "$SCRIPT_DIR/../backup_tui.sh" ]]; then
+        cp "$SCRIPT_DIR/../backup_tui.sh" "$target_root/root/backup_tui.sh"
+    fi
+}
+
 # ──────────────────────────────────────────────────────────────
 # ОБЩИЙ БЛОК: RU ЗЕРКАЛА
 # ──────────────────────────────────────────────────────────────
@@ -121,10 +171,18 @@ _chroot_base_config() {
         return 0
     fi
 
-    # Вызывается уже внутри chroot, переменные из install_vars.env
     source /root/install_vars.env
 
-    # Локаль и время
+    USER_PASSWORD="${USER_PASSWORD:-arch}"
+    ROOT_PASSWORD="${ROOT_PASSWORD:-arch}"
+
+    local ucode_img="intel-ucode.img"
+    [[ "${CPU_DRIVER:-intel-ucode}" == "amd-ucode" ]] && ucode_img="amd-ucode.img"
+    local root_opts="root=UUID=${ROOT_UUID} rw rootflags=subvol=@"
+    if [[ "${USE_LUKS:-no}" == "yes" ]]; then
+        root_opts="cryptdevice=UUID=$(blkid -s UUID -o value "$PART_ROOT"):cryptroot root=/dev/mapper/cryptroot rw rootflags=subvol=@"
+    fi
+
     ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime
     hwclock --systohc
     sed -i 's/^#\(en_US.UTF-8\)/\1/; s/^#\(ru_RU.UTF-8\)/\1/' /etc/locale.gen
@@ -141,7 +199,6 @@ KEYMAP=ru
 FONT=cyr-sun16
 EOF
 
-    # Хост
     echo "$HOSTNAME" > /etc/hostname
     cat > /etc/hosts << HEOF
 127.0.0.1   localhost
@@ -149,18 +206,33 @@ EOF
 127.0.1.1   ${HOSTNAME}.localdomain  ${HOSTNAME}
 HEOF
 
-    # Пользователь (пароль временный — сменим в финале --post)
     useradd -m -G wheel,audio,video,storage,optical,input -s /bin/zsh "$USERNAME"
     sed -i 's/^# \(%wheel ALL=(ALL:ALL) ALL\)/\1/' /etc/sudoers
-    echo "$USERNAME:arch" | chpasswd
-    echo "root:arch" | chpasswd
+    echo "$USERNAME:${USER_PASSWORD:-arch}" | chpasswd
+    echo "root:${ROOT_PASSWORD:-arch}" | chpasswd
 
-    # multilib
     sed -i '/^#\[multilib\]/{n;s/^#//};/^#\[multilib\]/s/^#//;' /etc/pacman.conf
     sed -i 's/^#ParallelDownloads/ParallelDownloads/; s/^#Color/Color/' /etc/pacman.conf
-    pacman -Sy >>"$LOG_FILE" 2>&1
 
-    # systemd-boot
+    if [[ "${USE_LUKS:-no}" == "yes" ]]; then
+        if grep -q 'encrypt' /etc/mkinitcpio.conf; then
+            :
+        elif grep -q '^HOOKS=' /etc/mkinitcpio.conf; then
+            sed -i -E 's/^HOOKS=\(([^)]*)block([^)]*)\)/HOOKS=(\1block encrypt\2)/' /etc/mkinitcpio.conf
+            if ! grep -q 'encrypt' /etc/mkinitcpio.conf; then
+                sed -i -E 's/^HOOKS=\((.*)\)$/HOOKS=(\1 block encrypt)/' /etc/mkinitcpio.conf
+            fi
+        fi
+    fi
+    if [[ "${GPU_DRIVER:-auto}" == "nvidia-dkms" ]]; then
+        if grep -q '^MODULES=' /etc/mkinitcpio.conf; then
+            sed -i -E 's/^MODULES=\(.*\)$/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' /etc/mkinitcpio.conf
+        else
+            echo 'MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)' >> /etc/mkinitcpio.conf
+        fi
+    fi
+    mkinitcpio -P >>"$LOG_FILE" 2>&1 || _die "mkinitcpio failed"
+
     bootctl install --path=/boot >>"$LOG_FILE" 2>&1
     cat > /boot/loader/loader.conf << 'EOF'
 default  arch.conf
@@ -171,37 +243,34 @@ EOF
     cat > /boot/loader/entries/arch.conf << EOF
 title   Arch Linux
 linux   /vmlinuz-linux
-initrd  /intel-ucode.img
+initrd  /${ucode_img}
 initrd  /initramfs-linux.img
-options root=UUID=${ROOT_UUID} rw \\
-        rootflags=subvol=@ \\
-        quiet loglevel=3 \\
-        nvidia_drm.modeset=1 \\
-        nvidia_drm.fbdev=1
+options ${root_opts} quiet loglevel=3
 EOF
     cat > /boot/loader/entries/arch-lts.conf << EOF
 title   Arch Linux (LTS)
 linux   /vmlinuz-linux-lts
-initrd  /intel-ucode.img
+initrd  /${ucode_img}
 initrd  /initramfs-linux-lts.img
-options root=UUID=${ROOT_UUID} rw rootflags=subvol=@ quiet loglevel=3
+options ${root_opts} quiet loglevel=3
 EOF
     cat > /boot/loader/entries/arch-fallback.conf << EOF
 title   Arch Linux (fallback)
 linux   /vmlinuz-linux
-initrd  /intel-ucode.img
+initrd  /${ucode_img}
 initrd  /initramfs-linux-fallback.img
-options root=UUID=${ROOT_UUID} rw rootflags=subvol=@
+options ${root_opts}
 EOF
 
     systemctl enable NetworkManager >>"$LOG_FILE" 2>&1
 
-    # Перекладываем скрипт для --post
-    cp /root/install_tui.sh "/home/$USERNAME/install_tui.sh"
+    mkdir -p "/home/$USERNAME/install" "/home/$USERNAME/config"
+    cp /root/install/install_tui.sh "/home/$USERNAME/install_tui.sh"
+    cp -a /root/install/. "/home/$USERNAME/install/"
+    cp -a /root/config/. "/home/$USERNAME/config/"
     cp /root/install_vars.env "/home/$USERNAME/install_vars.env"
-    chown "$USERNAME:$USERNAME" \
-        "/home/$USERNAME/install_tui.sh" \
-        "/home/$USERNAME/install_vars.env"
+    chmod 600 "/home/$USERNAME/install_vars.env"
+    chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
 }
 
 # ──────────────────────────────────────────────────────────────
@@ -237,8 +306,8 @@ _restore_backup_in_chroot() {
         return 0
     fi
 
-    # Выбираем последний бэкап
-    LATEST=$(find "$BACKUP_ROOT_PATH" -maxdepth 1 -mindepth 1 -type d | sort -r | head -1)
+    # Выбираем последний бэкап по времени модификации
+    LATEST=$(find "$BACKUP_ROOT_PATH" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
     if [ -z "$LATEST" ]; then
         _log "WARN: нет бэкапов в $BACKUP_ROOT_PATH"
         umount "$KIRILL_CHROOT" 2>/dev/null || true
@@ -406,6 +475,7 @@ GPGSCRIPT
 if [[ "$MODE" == "wizard" ]]; then
     wizard_run || exit 1
     stage_07_install
+    finish_install_prompt
     exit 0
 fi
 
@@ -419,7 +489,7 @@ fi
 # ══════════════════════════════════════════════════════
 if [[ "$MODE" == "menu" ]]; then
 
-command -v whiptail &>/dev/null || pacman -Sy --noconfirm libnewt 2>/dev/null
+command -v whiptail &>/dev/null || ensure_runtime_package libnewt
 
 CHOICE=$(whiptail --title "Teddy's Arch Installer — $(date '+%d.%m.%Y')" \
     --menu \
@@ -450,8 +520,7 @@ fi  # END menu
 # ══════════════════════════════════════════════════════════════
 if [[ "$MODE" == "clone" ]]; then
 
-command -v pv &>/dev/null || pacman -Sy --noconfirm pv 2>/dev/null || \
-    _die "pv не найден и не установился.\nsudo pacman -S pv"
+command -v pv &>/dev/null || ensure_runtime_package pv
 
 whiptail --title "Клонирование диска" --msgbox \
 "Полное клонирование диска (dd + pv).\n
@@ -565,7 +634,7 @@ fi  # END clone
 # ══════════════════════════════════════════════════════════════
 if [[ "$MODE" == "live" ]]; then
 
-command -v whiptail &>/dev/null || pacman -Sy --noconfirm libnewt 2>/dev/null
+command -v whiptail &>/dev/null || ensure_runtime_package libnewt
 preflight_checks
 _set_ru_mirrors
 
@@ -579,10 +648,12 @@ HOSTNAME=$(_input "Hostname" "Имя компьютера:" "archbox") || _die "
 
 TARGET_DISK=$(_select_target_disk)
 validate_disk_path "$TARGET_DISK" || _die "Некорректный диск: $TARGET_DISK"
-if [[ "$TARGET_DISK" =~ nvme[0-9]+n[0-9]+$ ]] || [[ "$TARGET_DISK" =~ mmcblk ]]; then
-    PART_EFI="${TARGET_DISK}p1"; PART_ROOT="${TARGET_DISK}p2"
-else
-    PART_EFI="${TARGET_DISK}1"; PART_ROOT="${TARGET_DISK}2"
+IFS='|' read -r PART_EFI PART_ROOT <<< "$(_derive_partition_names "$TARGET_DISK")"
+USE_LUKS=$(ask_luks_enabled)
+export USE_LUKS
+if [[ "$USE_LUKS" == "yes" ]]; then
+    LUKS_PASSWORD=$(ask_luks_password) || _die "Отменено."
+    export LUKS_PASSWORD
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -634,7 +705,7 @@ _log "Бэкап UUID: $BACKUP_UUID, Path: $BACKUP_SUBPATH"
     _step 2 "Синхронизация времени..."
     timedatectl set-ntp true || true
 
-    run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT"
+    run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT" "$USE_LUKS"
 
     _step 22 "pacstrap (~600МБ, 5–15 мин)..."
     pacstrap -K /mnt \
@@ -648,22 +719,28 @@ _log "Бэкап UUID: $BACKUP_UUID, Path: $BACKUP_SUBPATH"
     genfstab -U /mnt >> /mnt/etc/fstab
 
     _step 52 "Подготовка chroot..."
-    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    if [[ "${USE_LUKS:-no}" == "yes" ]]; then
+        ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot)
+    else
+        ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    fi
     cat > /mnt/root/install_vars.env << ENVEOF
 USERNAME="$USERNAME"
 HOSTNAME="$HOSTNAME"
 ROOT_UUID="$ROOT_UUID"
 PART_EFI="$PART_EFI"
 PART_ROOT="$PART_ROOT"
+USE_LUKS="${USE_LUKS:-no}"
+CPU_DRIVER="${CPU_DRIVER:-auto}"
+GPU_DRIVER="${GPU_DRIVER:-auto}"
 BACKUP_UUID="$BACKUP_UUID"
 BACKUP_SUBPATH="$BACKUP_SUBPATH"
 ENVEOF
     cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
-    cp "$0" /mnt/root/install_tui.sh
-    chmod +x /mnt/root/install_tui.sh
+    copy_runtime_to_chroot /mnt
 
     _step 55 "chroot: настройка системы + восстановление бэкапа..."
-    arch-chroot /mnt /bin/bash /root/install_tui.sh --chroot
+    arch-chroot /mnt env USER_PASSWORD="$USER_PASSWORD" ROOT_PASSWORD="$ROOT_PASSWORD" /bin/bash /root/install/install_tui.sh --chroot
 
     _step 100 "Готово!"
     sleep 1
@@ -697,7 +774,7 @@ fi
 # ══════════════════════════════════════════════════════════════
 if [[ "$MODE" == "fresh" ]]; then
 
-command -v whiptail &>/dev/null || pacman -Sy --noconfirm libnewt 2>/dev/null
+command -v whiptail &>/dev/null || ensure_runtime_package libnewt
 preflight_checks
 _set_ru_mirrors
 
@@ -711,10 +788,12 @@ HOSTNAME=$(_input "Hostname" "Имя компьютера:" "archbox") || _die "
 
 TARGET_DISK=$(_select_target_disk)
 validate_disk_path "$TARGET_DISK" || _die "Некорректный диск: $TARGET_DISK"
-if [[ "$TARGET_DISK" =~ nvme[0-9]+n[0-9]+$ ]] || [[ "$TARGET_DISK" =~ mmcblk ]]; then
-    PART_EFI="${TARGET_DISK}p1"; PART_ROOT="${TARGET_DISK}p2"
-else
-    PART_EFI="${TARGET_DISK}1"; PART_ROOT="${TARGET_DISK}2"
+IFS='|' read -r PART_EFI PART_ROOT <<< "$(_derive_partition_names "$TARGET_DISK")"
+USE_LUKS=$(ask_luks_enabled)
+export USE_LUKS
+if [[ "$USE_LUKS" == "yes" ]]; then
+    LUKS_PASSWORD=$(ask_luks_password) || _die "Отменено."
+    export LUKS_PASSWORD
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -732,7 +811,7 @@ _log "Диск: $TARGET_DISK, Пользователь: $USERNAME, Хост: $HO
     _step 2 "Синхронизация времени..."
     timedatectl set-ntp true || true
 
-    run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT"
+    run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT" "$USE_LUKS"
 
     _step 22 "pacstrap..."
     pacstrap -K /mnt \
@@ -746,22 +825,28 @@ _log "Диск: $TARGET_DISK, Пользователь: $USERNAME, Хост: $HO
     genfstab -U /mnt >> /mnt/etc/fstab
 
     _step 52 "Подготовка chroot..."
-    ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    if [[ "${USE_LUKS:-no}" == "yes" ]]; then
+        ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot)
+    else
+        ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
+    fi
     cat > /mnt/root/install_vars.env << ENVEOF
 USERNAME="$USERNAME"
 HOSTNAME="$HOSTNAME"
 ROOT_UUID="$ROOT_UUID"
 PART_EFI="$PART_EFI"
 PART_ROOT="$PART_ROOT"
+USE_LUKS="${USE_LUKS:-no}"
+CPU_DRIVER="${CPU_DRIVER:-auto}"
+GPU_DRIVER="${GPU_DRIVER:-auto}"
 BACKUP_UUID="Пропустить"
 BACKUP_SUBPATH=""
 ENVEOF
     cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
-    cp "$0" /mnt/root/install_tui.sh
-    chmod +x /mnt/root/install_tui.sh
+    copy_runtime_to_chroot /mnt
 
     _step 55 "chroot: настройка (без бэкапа)..."
-    arch-chroot /mnt /bin/bash /root/install_tui.sh --chroot-fresh
+    arch-chroot /mnt env USER_PASSWORD="$USER_PASSWORD" ROOT_PASSWORD="$ROOT_PASSWORD" /bin/bash /root/install/install_tui.sh --chroot-fresh
 
     _step 100 "Готово!"
     sleep 1

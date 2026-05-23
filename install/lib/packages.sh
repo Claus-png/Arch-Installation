@@ -4,7 +4,7 @@ CATEGORIES=(
   "CLI Tools:btop,fastfetch,eza,bat,fzf,zoxide,ripgrep,fd,micro,kitty,tmux,stow,wget,curl,rsync,jq,yq"
   "Desktop (KDE):plasma-meta,sddm,xwaylandvideobridge,spectacle,kdeconnect,dolphin,ark,gwenview,okular"
   "Gaming:steam,lutris,heroic-games-launcher,mangohud,gamemode,prismlauncher,wine-staging,winetricks"
-  "Dev:git,base-devel,neovim,visual-studio-code-bin,rustup,docker,docker-compose,nodejs,python,python-pip,lazygit"
+  "Dev:git,base-devel,neovim,rustup,docker,docker-compose,nodejs,python,python-pip,lazygit"
   "Security:keepassxc,ufw,gufw,wireguard-tools,veracrypt,firejail,fail2ban"
   "Media:firefox,telegram-desktop,vesktop,qbittorrent,vlc,mpv,obs-studio,flameshot"
   "Fonts & Themes:ttf-jetbrains-mono-nerd,ttf-firacode-nerd,noto-fonts-emoji,noto-fonts-cjk,papirus-icon-theme"

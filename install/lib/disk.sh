@@ -2,6 +2,20 @@
 
 set -u -o pipefail
 
+validate_disk_path() {
+    local disk="$1"
+    [[ "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|mmcblk[0-9]+)$ ]]
+}
+
+_derive_partition_names() {
+    local disk="$1"
+    if [[ "$disk" =~ nvme[0-9]+n[0-9]+$ ]] || [[ "$disk" =~ mmcblk[0-9]+$ ]]; then
+        echo "${disk}p1|${disk}p2"
+    else
+        echo "${disk}1|${disk}2"
+    fi
+}
+
 _partition_disk() {
     local disk="$1"
     local part_efi="$2"
@@ -36,16 +50,16 @@ _partition_disk() {
     run_cmd "format EFI" mkfs.fat -F32 -n EFI "$part_efi"
 
     if [[ "$use_luks" == "yes" ]]; then
-        run_cmd "format LUKS" bash -lc 'printf "%s" "$LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 "$PART_ROOT" -'
-        run_cmd "open LUKS" bash -lc 'printf "%s" "$LUKS_PASSWORD" | cryptsetup open "$PART_ROOT" cryptroot'
+        run_cmd "format LUKS" printf '%s' "$LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 "$part_root" -
+        run_cmd "open LUKS" printf '%s' "$LUKS_PASSWORD" | cryptsetup open "$part_root" cryptroot
         TARGET_BTRFS="/dev/mapper/cryptroot"
     else
         TARGET_BTRFS="$part_root"
-        run_cmd "format root" mkfs.btrfs -L ARCH -f "$TARGET_BTRFS"
     fi
 
-    local BOPTS="noatime,compress=zstd:3,space_cache=v2,discard=async"
+    run_cmd "format root" mkfs.btrfs -L ARCH -f "$TARGET_BTRFS"
 
+    local BOPTS="noatime,compress=zstd:3,space_cache=v2,discard=async"
     run_cmd "mount root for subvolumes" mount "$TARGET_BTRFS" /mnt
     run_cmd "create @ subvolume" btrfs subvolume create "/mnt/@"
     run_cmd "create @home subvolume" btrfs subvolume create "/mnt/@home"
@@ -66,15 +80,6 @@ _partition_disk() {
     ROOT_UUID=$(blkid -s UUID -o value "$part_root")
     export ROOT_UUID
     stage_done "disk_done"
-}
-
-_derive_partition_names() {
-    local disk="$1"
-    if [[ "$disk" =~ nvme[0-9]+n[0-9]+$ ]] || [[ "$disk" =~ mmcblk[0-9]+$ ]]; then
-        echo "${disk}p1|${disk}p2"
-    else
-        echo "${disk}1|${disk}2"
-    fi
 }
 
 _select_target_disk() {
@@ -98,7 +103,7 @@ _select_target_disk() {
     local CHOSEN
     CHOSEN=$(whiptail --title "⚠  Выбор диска для УСТАНОВКИ  ⚠" \
         --menu \
-        "Выбери диск для Arch Linux.\n\n!! ВСЕ ДАННЫЕ НА НЁМ БУДУТ УНИЧТОЖЕНЫ !!\n\nТвой SSD ~465ГБ. НЕ выбирай HDD 3.7ТБ и КИРИЛЛ 931ГБ!" \
+        "Выбери диск для Arch Linux.\n\n!! ВСЕ ДАННЫЕ НА НЁМ БУДУТ УНИЧТОЖЕНЫ !!" \
         18 74 8 "${DISK_LIST[@]}" \
         3>&1 1>&2 2>&3) || _die "Установка отменена."
 

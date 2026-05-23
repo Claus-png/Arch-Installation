@@ -13,6 +13,12 @@ ensure_state_dir() {
     mkdir -p "$INSTALL_STATE_DIR"
 }
 
+reset_install_state() {
+    ensure_state_dir
+    rm -f "$INSTALL_STATE_DIR"/*.done
+    _log "Install state reset"
+}
+
 mark_step() {
     local step="$1"
     touch "$INSTALL_STATE_DIR/${step}.done"
@@ -42,8 +48,13 @@ run_stage() {
         _log "[dry-run] stage ${stage}: $*"
         return 0
     fi
-    "$@"
-    stage_done "$stage"
+    if "$@"; then
+        stage_done "$stage"
+        _log "Stage ${stage}: complete"
+        return 0
+    fi
+    _log "Stage ${stage}: failed"
+    return 1
 }
 
 run_step() {
@@ -55,12 +66,15 @@ run_step() {
     fi
     if [[ "$DRY_RUN" == "1" ]]; then
         _log "[dry-run] step ${step}: $*"
+        mark_step "$step"
         return 0
     fi
     "$@"
     local code=$?
     if [[ "$code" -eq 0 ]]; then
         mark_step "$step"
+    else
+        _log "Step ${step}: failed with exit ${code}"
     fi
     return "$code"
 }
@@ -91,6 +105,8 @@ apply_defaults() {
     export ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-0}"
     export PACKAGE_LIST="${PACKAGE_LIST:-${DEFAULT_PACKAGE_LIST:-}}"
     export LUKS_PASSWORD="${LUKS_PASSWORD:-}"
+    export USER_PASSWORD="${USER_PASSWORD:-${DEFAULT_USER_PASSWORD:-arch}}"
+    export ROOT_PASSWORD="${ROOT_PASSWORD:-${DEFAULT_ROOT_PASSWORD:-arch}}"
 }
 
 _detect_cpu() {
@@ -162,13 +178,25 @@ configure_mkinitcpio() {
     local target_root="$1"
     local use_luks="$2"
     local gpu_driver="$3"
+    local mkinitcpio_conf="$target_root/etc/mkinitcpio.conf"
 
     if [[ "$use_luks" == "yes" ]]; then
-        sed -i 's/^HOOKS=(\(.*\)block \(.*\))/HOOKS=(\1block encrypt \2)/' "$target_root/etc/mkinitcpio.conf"
+        if grep -q 'encrypt' "$mkinitcpio_conf"; then
+            :
+        elif grep -q '^HOOKS=' "$mkinitcpio_conf"; then
+            sed -i -E 's/^HOOKS=\(([^)]*)block([^)]*)\)/HOOKS=(\1block encrypt\2)/' "$mkinitcpio_conf"
+            if ! grep -q 'encrypt' "$mkinitcpio_conf"; then
+                sed -i -E 's/^HOOKS=\((.*)\)$/HOOKS=(\1 block encrypt)/' "$mkinitcpio_conf"
+            fi
+        fi
     fi
 
     if [[ "$gpu_driver" == "nvidia-dkms" ]]; then
-        sed -i 's/^MODULES=(.*)$/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' "$target_root/etc/mkinitcpio.conf"
+        if grep -q '^MODULES=' "$mkinitcpio_conf"; then
+            sed -i -E 's/^MODULES=\(.*\)$/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' "$mkinitcpio_conf"
+        else
+            echo 'MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)' >> "$mkinitcpio_conf"
+        fi
     fi
 
     arch-chroot "$target_root" mkinitcpio -P >> "$LOG_FILE" 2>&1
@@ -186,12 +214,12 @@ EOF
 
 validate_disk_path() {
     local disk="$1"
-    [[ "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+)$ ]]
+    [[ "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|mmcblk[0-9]+)$ ]]
 }
 
 validate_backup_device() {
     local disk="$1"
-    [[ "$disk" == "Пропустить" || "$disk" == "Восстановить вручную после перезагрузки" || "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+)$ ]]
+    [[ "$disk" == "Пропустить" || "$disk" == "Восстановить вручную после перезагрузки" || "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|mmcblk[0-9]+)$ ]]
 }
 
 stage_text() {
@@ -209,7 +237,7 @@ preflight_checks() {
 
     [ -d /sys/firmware/efi/efivars ] || _die "BIOS-режим! Нужен UEFI."
     timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || _die "Не удалось синхронизировать время"
-    ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1 || _die "Нет интернет-соединения"
+    curl -fsSL --max-time 5 https://archlinux.org >/dev/null 2>&1 || _die "Нет интернет-соединения"
 
     local mem_gb
     mem_gb=$(awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo)

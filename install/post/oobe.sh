@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
 
+set -u -o pipefail
+
+if ! declare -F _msg >/dev/null 2>&1; then
+    _msg() {
+        printf '%s\n' "$*"
+    }
+fi
+
+parse_checklist_items() {
+    local raw="$1"
+    local -n out_ref="$2"
+
+    out_ref=()
+    [[ -z "$raw" ]] && return 0
+
+    while IFS= read -r item; do
+        [[ -n "$item" ]] || continue
+        item=${item//\"/}
+        out_ref+=("$item")
+    done < <(printf '%s\n' "$raw" | tr ' ' '\n')
+}
+
 run_pacman() {
     local -a args=("$@")
     if [[ "$EUID" -eq 0 ]]; then
@@ -15,11 +37,14 @@ run_pacman() {
 }
 
 install_oobe_packages() {
-    local selected="$1"
+    local raw="$1"
+    local -a selected=()
     local -a repo_pkgs=()
     local -a aur_pkgs=()
 
-    for pack in $selected; do
+    parse_checklist_items "$raw" selected
+
+    for pack in "${selected[@]}"; do
         case "$pack" in
             gaming)
                 repo_pkgs+=(steam lutris mangohud wine-staging winetricks)
@@ -35,21 +60,23 @@ install_oobe_packages() {
     done
 
     if [[ ${#repo_pkgs[@]} -gt 0 ]]; then
-        run_pacman "${repo_pkgs[@]}" || true
+        _run_optional "install OOBE repo packages" run_pacman "${repo_pkgs[@]}"
     fi
 
     if [[ ${#aur_pkgs[@]} -gt 0 ]]; then
-        if command -v paru >/dev/null 2>&1; then
-            if [[ "$EUID" -eq 0 ]]; then
-                paru -S --needed --noconfirm "${aur_pkgs[@]}" || true
-            elif sudo -n true >/dev/null 2>&1; then
-                sudo paru -S --needed --noconfirm "${aur_pkgs[@]}" || true
-            else
-                _msg "Не удалось установить AUR-пакеты: paru недоступен или нет sudo."
-            fi
-        else
-            _msg "AUR-пакеты пропущены: paru не установлен."
+        if [[ "$EUID" -eq 0 ]]; then
+            _msg "AUR-пакеты нельзя устанавливать от root. Запустите OOBE от обычного пользователя."
+            return 1
         fi
+        if ! command -v paru >/dev/null 2>&1; then
+            _msg "AUR-пакеты пропущены: paru не установлен."
+            return 1
+        fi
+        if ! sudo -n true >/dev/null 2>&1; then
+            _msg "Не удалось установить AUR-пакеты: нет sudo."
+            return 1
+        fi
+        sudo paru -S --needed --noconfirm "${aur_pkgs[@]}" || return 1
     fi
 }
 
@@ -62,11 +89,23 @@ run_oobe() {
     fi
 
     local pass1 pass2
+    local current_user
+    current_user=$(id -un)
     while true; do
         pass1=$(_password_input "Set password" "Введите дополнительный пароль:") || return 1
         pass2=$(_password_input "Confirm password" "Повторите пароль:") || return 1
         if [[ "$pass1" == "$pass2" ]]; then
-            echo "$(whoami):$pass1" | chpasswd >/dev/null 2>&1 || true
+            if [[ "$EUID" -eq 0 ]]; then
+                if ! printf '%s:%s\n' "$current_user" "$pass1" | chpasswd >/dev/null 2>&1; then
+                    _msg "Не удалось обновить пароль пользователя $current_user."
+                    return 1
+                fi
+            else
+                if ! printf '%s:%s\n' "$current_user" "$pass1" | sudo chpasswd >/dev/null 2>&1; then
+                    _msg "Не удалось обновить пароль пользователя $current_user."
+                    return 1
+                fi
+            fi
             break
         fi
         _msg "Пароли не совпадают, попробуйте снова."
@@ -77,18 +116,19 @@ run_oobe() {
 
     if whiptail --yesno "Хотите установить дополнительные пакеты сейчас?" 8 60 3>&1 1>&2 2>&3; then
         local oobe_packs
-        oobe_packs=$(whiptail --title "Дополнительно" --checklist "Выберите наборы:" 16 72 6 \
+        if ! oobe_packs=$(whiptail --title "Дополнительно" --checklist "Выберите наборы:" 16 72 6 \
             "gaming" "Steam, Lutris, MangoHUD, Wine" OFF \
             "dev" "Docker, Node, Python, VS Code" OFF \
-            "ai" "Ollama, LM Studio" OFF 3>&1 1>&2 2>&3) || true
-        if [[ -n "$oobe_packs" ]]; then
-            install_oobe_packages "$oobe_packs"
+            "ai" "Ollama, LM Studio" OFF 3>&1 1>&2 2>&3); then
+            _log "WARN: отменён выбор OOBE пакетов"
+            oobe_packs=""
         fi
+        install_oobe_packages "$oobe_packs"
     fi
 
-    if find / -maxdepth 3 \( -name '*.tar.gz' -o -name '*.zip' \) 2>/dev/null | grep -q 'backup\|kde\|kitty'; then
-        if whiptail --yesno "Найден архив для восстановления. Восстановить сейчас?" 8 60 3>&1 1>&2 2>&3; then
-            _msg "Восстановление из архива нужно запускать через backup_tui.sh."
+    if [[ -f "$HOME/.config/kdeglobals" || -d "$HOME/.config/kitty" ]]; then
+        if whiptail --yesno "Найдено пользовательское окружение. Запустить backup_tui.sh для восстановления?" 8 60 3>&1 1>&2 2>&3; then
+            _msg "Запуск восстановления нужно делать через backup_tui.sh."
         fi
     fi
 }

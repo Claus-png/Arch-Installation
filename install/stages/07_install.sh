@@ -19,6 +19,8 @@ PART_ROOT="$PART_ROOT"
 USE_LUKS="$USE_LUKS"
 CPU_DRIVER="$CPU_DRIVER"
 GPU_DRIVER="$GPU_DRIVER"
+TIMEZONE="$TIMEZONE"
+ZRAM_SIZE_MB="$ZRAM_SIZE_MB"
 EOF
     umask "$old_umask"
     chmod 600 /mnt/root/install_vars.env
@@ -53,9 +55,14 @@ install_hardware_packages() {
 
 write_bootloader() {
     local ucode_img="intel-ucode.img"
+    local root_opts="root=UUID=$(blkid -s UUID -o value "$PART_ROOT") rw rootflags=subvol=@"
     [[ "$CPU_DRIVER" == "amd-ucode" ]] && ucode_img="amd-ucode.img"
 
-    bootctl install --path=/mnt/boot >> "$LOG_FILE" 2>&1 || _die "Не удалось установить systemd-boot"
+    if [[ "$USE_LUKS" == "yes" ]]; then
+        root_opts="cryptdevice=UUID=$(blkid -s UUID -o value "$PART_ROOT"):cryptroot root=/dev/mapper/cryptroot rw rootflags=subvol=@"
+    fi
+
+    bootctl --esp-path=/mnt/boot install >> "$LOG_FILE" 2>&1 || _die "Не удалось установить systemd-boot"
     mkdir -p /mnt/boot/loader/entries
     cat > /mnt/boot/loader/loader.conf <<EOF
 default arch.conf
@@ -64,50 +71,126 @@ console-mode max
 editor no
 EOF
 
-    if [[ "$USE_LUKS" == "yes" ]]; then
-        cat > /mnt/boot/loader/entries/arch.conf <<EOF
+    cat > /mnt/boot/loader/entries/arch.conf <<EOF
 title Arch Linux
 linux /vmlinuz-linux
 initrd /${ucode_img}
 initrd /initramfs-linux.img
-options cryptdevice=UUID=$(blkid -s UUID -o value "$PART_ROOT"):cryptroot root=/dev/mapper/cryptroot rw rootflags=subvol=@ quiet
+options ${root_opts} quiet loglevel=3
 EOF
-    else
-        cat > /mnt/boot/loader/entries/arch.conf <<EOF
-title Arch Linux
+
+    cat > /mnt/boot/loader/entries/arch-lts.conf <<EOF
+title Arch Linux (LTS)
+linux /vmlinuz-linux-lts
+initrd /${ucode_img}
+initrd /initramfs-linux-lts.img
+options ${root_opts} quiet loglevel=3
+EOF
+
+    cat > /mnt/boot/loader/entries/arch-fallback.conf <<EOF
+title Arch Linux (fallback)
 linux /vmlinuz-linux
 initrd /${ucode_img}
-initrd /initramfs-linux.img
-options root=UUID=$(blkid -s UUID -o value "$PART_ROOT") rw rootflags=subvol=@ quiet
+initrd /initramfs-linux-fallback.img
+options ${root_opts}
 EOF
-    fi
 }
 
 configure_locale_and_user() {
-    arch-chroot /mnt bash -lc 'ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime'
-    arch-chroot /mnt bash -lc 'hwclock --systohc'
-    arch-chroot /mnt bash -lc 'sed -i "s/^#\\(en_US.UTF-8 UTF-8\\)/\\1/; s/^#\\(ru_RU.UTF-8 UTF-8\\)/\\1/" /etc/locale.gen'
-    arch-chroot /mnt bash -lc 'locale-gen'
-    arch-chroot /mnt bash -lc 'echo LANG=ru_RU.UTF-8 > /etc/locale.conf'
-    arch-chroot /mnt bash -lc "useradd -m -G wheel,audio,video,storage,optical,input -s /bin/zsh '$USERNAME'"
-    arch-chroot /mnt bash -lc "echo '$USERNAME:${USER_PASSWORD:-arch}' | chpasswd"
-    arch-chroot /mnt bash -lc "echo 'root:${ROOT_PASSWORD:-arch}' | chpasswd"
-    arch-chroot /mnt bash -lc 'sed -i "s/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/" /etc/sudoers'
-    arch-chroot /mnt bash -lc "echo '$HOSTNAME' > /etc/hostname"
-    arch-chroot /mnt bash -lc "mkdir -p \"/home/$USERNAME/install\" \"/home/$USERNAME/config\" && cp /root/install/install_tui.sh \"/home/$USERNAME/install_tui.sh\" && cp -a /root/install/. \"/home/$USERNAME/install/\" && cp -a /root/config/. \"/home/$USERNAME/config/\" && cp /root/install_vars.env \"/home/$USERNAME/install_vars.env\" && chmod 600 \"/home/$USERNAME/install_vars.env\" && chown -R \"$USERNAME:$USERNAME\" \"/home/$USERNAME\""
+    local tz="${TIMEZONE:-Europe/Moscow}"
+
+    arch-chroot /mnt bash -s "$tz" "$USERNAME" "$HOSTNAME" "$USER_PASSWORD" "$ROOT_PASSWORD" <<'CHROOT'
+set -euo pipefail
+TZ="$1"
+USERNAME="$2"
+HOSTNAME="$3"
+USER_PASSWORD="$4"
+ROOT_PASSWORD="$5"
+
+ln -sf "/usr/share/zoneinfo/${TZ}" /etc/localtime
+hwclock --systohc
+sed -i "s/^#\(en_US.UTF-8 UTF-8\)/\1/; s/^#\(ru_RU.UTF-8 UTF-8\)/\1/" /etc/locale.gen
+locale-gen
+printf 'LANG=ru_RU.UTF-8\n' > /etc/locale.conf
+cat > /etc/vconsole.conf <<'EOF'
+KEYMAP=ru
+FONT=cyr-sun16
+EOF
+
+useradd -m -G wheel,audio,video,storage,optical,input -s /bin/zsh "$USERNAME"
+if ! printf '%s\n%s\n' "$USER_PASSWORD" "$USER_PASSWORD" | chpasswd; then
+    echo "Failed to set user password" >&2
+    exit 1
+fi
+if ! printf '%s\n%s\n' "$ROOT_PASSWORD" "$ROOT_PASSWORD" | chpasswd; then
+    echo "Failed to set root password" >&2
+    exit 1
+fi
+sed -i "s/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/" /etc/sudoers
+printf '%s\n' "$HOSTNAME" > /etc/hostname
+
+mkdir -p "/home/$USERNAME/install" "/home/$USERNAME/config"
+cp /root/install/install_tui.sh "/home/$USERNAME/install_tui.sh"
+cp -a /root/install/. "/home/$USERNAME/install/"
+cp -a /root/config/. "/home/$USERNAME/config/"
+cp /root/install_vars.env "/home/$USERNAME/install_vars.env"
+chmod 600 "/home/$USERNAME/install_vars.env"
+chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
+CHROOT
+}
+
+install_selected_packages() {
+    local -a pacman_packages=()
+    local -a aur_packages=()
+    local pkg
+
+    if [[ -z "${SELECTED_PACKAGES:-}" ]]; then
+        _log "No packages selected; skipping package install"
+        return 0
+    fi
+
+    read -r -a pacman_packages <<< "$SELECTED_PACKAGES"
+    for pkg in "${pacman_packages[@]}"; do
+        case "$pkg" in
+            aur:*)
+                aur_packages+=("${pkg#aur:}")
+                ;;
+            paru:*)
+                aur_packages+=("${pkg#paru:}")
+                ;;
+        esac
+    done
+
+    if [[ ${#pacman_packages[@]} -gt 0 ]]; then
+        local -a pacman_filtered=()
+        for pkg in "${pacman_packages[@]}"; do
+            case "$pkg" in
+                aur:*|paru:*)
+                    ;;
+                *)
+                    pacman_filtered+=("$pkg")
+                    ;;
+            esac
+        done
+        if [[ ${#pacman_filtered[@]} -gt 0 ]]; then
+            run_step packages arch-chroot /mnt pacman -S --needed --noconfirm "${pacman_filtered[@]}"
+        fi
+    fi
+
+    if [[ ${#aur_packages[@]} -gt 0 ]]; then
+        arch-chroot /mnt pacman -S --needed --noconfirm base-devel git >/dev/null 2>&1
+        arch-chroot /mnt bash -lc 'if ! command -v paru >/dev/null 2>&1; then
+            rm -rf /tmp/paru
+            git clone https://aur.archlinux.org/paru.git /tmp/paru
+            (cd /tmp/paru && makepkg -si --noconfirm >/dev/null 2>&1)
+        fi'
+        arch-chroot /mnt bash -lc "paru -S --needed --noconfirm $(printf '%q ' "${aur_packages[@]}")"
+    fi
 }
 
 stage_07_install() {
-    run_step pacstrap pacstrap -K /mnt base linux linux-firmware linux-lts base-devel networkmanager sudo git curl wget zsh whiptail btrfs-progs efibootmgr intel-ucode amd-ucode
-
-    if [[ -n "${SELECTED_PACKAGES:-}" ]]; then
-        local -a selected_packages=()
-        read -r -a selected_packages <<< "$SELECTED_PACKAGES"
-        run_step packages arch-chroot /mnt pacman -S --needed --noconfirm "${selected_packages[@]}"
-    else
-        _log "No packages selected; skipping package install"
-    fi
-
+    run_step pacstrap pacstrap -K /mnt base linux linux-firmware linux-lts base-devel networkmanager sudo git curl wget zsh whiptail btrfs-progs efibootmgr
+    install_selected_packages
     run_step hardware install_hardware_packages
     run_step zram configure_zram /mnt
     run_step mkinitcpio configure_mkinitcpio /mnt "$USE_LUKS" "$GPU_DRIVER"

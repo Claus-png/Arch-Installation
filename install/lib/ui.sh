@@ -5,26 +5,44 @@ set -u -o pipefail
 LOG_FILE="${LOG_FILE:-/var/log/install.log}"
 PROGRESS_PIPE="${PROGRESS_PIPE:-/tmp/progress_pipe}"
 PROGRESS_STATE_FILE="${PROGRESS_STATE_FILE:-/tmp/progress_state}"
-PROGRESS_FD="${PROGRESS_FD:-3}"
+PROGRESS_FD=""
 PROGRESS_BAR_PID=""
 NEWT_COLORS="${NEWT_COLORS:-root=,black roottext=,white title=,white checkbox=,cyan button=,cyan}"
 INSTALL_BRAND="Teddy Installer"
 export NEWT_COLORS
 
 _cleanup() {
-    [ -n "${SUDO_KEEP_PID:-}" ] && kill "$SUDO_KEEP_PID" 2>/dev/null || true
-    finish_progress_bar >/dev/null 2>&1 || true
-    stty sane 2>/dev/null || true
-    tput sgr0 2>/dev/null || true
+    if [ -n "${SUDO_KEEP_PID:-}" ]; then
+        kill "$SUDO_KEEP_PID" 2>/dev/null || :
+    fi
+    if ! finish_progress_bar >/dev/null 2>&1; then
+        :
+    fi
+    if ! stty sane 2>/dev/null; then
+        :
+    fi
+    if ! tput sgr0 2>/dev/null; then
+        :
+    fi
     echo -e "\n[!] Выход из установщика. Лог сохранен в: $LOG_FILE"
 }
 
 _log() {
-    mkdir -p "$(dirname "$LOG_FILE")"
     echo "[$(date +%H:%M:%S)] $*" >> "$LOG_FILE"
 }
 
+_run_optional() {
+    local desc="$1"
+    shift
+    if "$@"; then
+        return 0
+    fi
+    _log "WARN: $desc"
+    return 0
+}
+
 _die() {
+    _log "FATAL: $*"
     whiptail --title "КРИТИЧЕСКАЯ ОШИБКА" --msgbox "$*\n\nЛог: $LOG_FILE" 12 72
     exit 1
 }
@@ -72,7 +90,13 @@ _step() {
     local pct="$1"
     local msg="$2"
     progress_update "$pct"
-    printf 'XXX\n%s\nXXX\n' "$msg"
+
+    if [[ -e /dev/fd/3 ]]; then
+        printf 'XXX\n%s\n%s\nXXX\n' "$pct" "$msg" >&3
+    else
+        printf 'XXX\n%s\n%s\nXXX\n' "$pct" "$msg"
+    fi
+
     _log "$pct% — $msg"
 }
 
@@ -86,7 +110,9 @@ start_progress_bar() {
     local title="$1"
     local body="${2:-Инициализация...}"
 
-    finish_progress_bar >/dev/null 2>&1 || true
+    if ! finish_progress_bar >/dev/null 2>&1; then
+        :
+    fi
     coproc PROGRESS_COPROC {
         while IFS= read -r value || [[ -n "$value" ]]; do
             [[ -n "$value" ]] || continue
@@ -101,11 +127,13 @@ start_progress_bar() {
 
 finish_progress_bar() {
     if [[ -n "${PROGRESS_FD:-}" ]]; then
-        eval "exec ${PROGRESS_FD}>&-"
+        exec {PROGRESS_FD}>&-
         PROGRESS_FD=""
     fi
     if [[ -n "$PROGRESS_BAR_PID" ]]; then
-        wait "$PROGRESS_BAR_PID" 2>/dev/null || true
+        if ! wait "$PROGRESS_BAR_PID" 2>/dev/null; then
+            :
+        fi
         PROGRESS_BAR_PID=""
     fi
 }

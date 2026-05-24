@@ -6,16 +6,42 @@
 set -eEuo pipefail
 
 DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then
-    DRY_RUN=1
-    shift
-fi
+RESET_STATE="${RESET_STATE:-0}"
+MODE=""
 
-MODE="${1:-wizard}"
-[[ "$MODE" == "--post" ]]          && MODE="post"
-[[ "$MODE" == "--chroot" ]]        && MODE="chroot"
-[[ "$MODE" == "--chroot-fresh" ]]  && MODE="chroot_fresh"
-[[ "$MODE" == "--oobe" ]]          && MODE="oobe"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --reset-state)
+            RESET_STATE=1
+            shift
+            ;;
+        --post|--chroot|--chroot-fresh|--oobe|wizard)
+            MODE="$1"
+            shift
+            break
+            ;;
+        *)
+            echo "Неизвестный аргумент: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+case "${MODE:-wizard}" in
+    --post)         MODE="post" ;;
+    --chroot)       MODE="chroot" ;;
+    --chroot-fresh) MODE="chroot_fresh" ;;
+    --oobe)         MODE="oobe" ;;
+    wizard)         MODE="wizard" ;;
+    "")            MODE="wizard" ;;
+    *)              echo "Неизвестный режим: $MODE" >&2
+                    exit 1
+                    ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d /root/install/lib ]]; then
@@ -46,7 +72,9 @@ source "$POST_DIR/oobe.sh"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 ensure_state_dir
-reset_install_state
+if [[ "$RESET_STATE" == "1" ]]; then
+    reset_install_state
+fi
 init_progress_pipe
 trap '_cleanup' EXIT
 trap '_on_error $LINENO "$BASH_COMMAND"' ERR
@@ -54,6 +82,7 @@ trap 'exit 1' INT TERM
 _load_defaults
 load_profile
 apply_defaults
+_check_deps
 
 ensure_runtime_package() {
     local pkg="$1"
@@ -81,15 +110,12 @@ wizard_run() {
         autopilot=1
     fi
 
-    start_progress_bar "Wizard" "Preparing installer"
-    progress_update 5
-
     if [[ "$autopilot" -eq 1 ]]; then
-        stage_01_welcome >/dev/null 2>&1 || true
-        stage_02_preflight >/dev/null 2>&1 || true
-        stage_03_disk_setup >/dev/null 2>&1 || true
-        stage_04_user_config >/dev/null 2>&1 || true
-        stage_05_packages >/dev/null 2>&1 || true
+        stage_01_welcome >/dev/null 2>&1
+        stage_02_preflight >/dev/null 2>&1
+        stage_03_disk_setup >/dev/null 2>&1
+        stage_04_user_config >/dev/null 2>&1
+        stage_05_packages >/dev/null 2>&1
         if stage_06_summary; then
             return 0
         fi
@@ -135,6 +161,7 @@ finish_install_prompt() {
 
 copy_runtime_to_chroot() {
     local target_root="$1"
+    mountpoint -q "$target_root" || _die "Не смонтировано: $target_root"
     mkdir -p "$target_root/root"
     rm -rf "$target_root/root/install" "$target_root/root/config"
     mkdir -p "$target_root/root/install" "$target_root/root/config"
@@ -162,6 +189,14 @@ MIRRORS
     _log "RU зеркала установлены"
 }
 
+_set_mirrors() {
+    if whiptail --yesno "Использовать зеркала для России?\n(Yandex, TrueNetwork, Regiocoms)" 8 60 3>&1 1>&2 2>&3; then
+        _set_ru_mirrors
+    else
+        _log "Используются системные зеркала из настроек среды"
+    fi
+}
+
 # ──────────────────────────────────────────────────────────────
 # ОБЩИЙ БЛОК: CHROOT BASE CONFIG (locale, hostname, user, boot)
 # ──────────────────────────────────────────────────────────────
@@ -183,7 +218,8 @@ _chroot_base_config() {
         root_opts="cryptdevice=UUID=$(blkid -s UUID -o value "$PART_ROOT"):cryptroot root=/dev/mapper/cryptroot rw rootflags=subvol=@"
     fi
 
-    ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime
+    local tz="${TIMEZONE:-Europe/Moscow}"
+    ln -sf "/usr/share/zoneinfo/${tz}" /etc/localtime
     hwclock --systohc
     sed -i 's/^#\(en_US.UTF-8\)/\1/; s/^#\(ru_RU.UTF-8\)/\1/' /etc/locale.gen
     locale-gen >>"$LOG_FILE" 2>&1
@@ -206,10 +242,19 @@ EOF
 127.0.1.1   ${HOSTNAME}.localdomain  ${HOSTNAME}
 HEOF
 
-    useradd -m -G wheel,audio,video,storage,optical,input -s /bin/zsh "$USERNAME"
-    sed -i 's/^# \(%wheel ALL=(ALL:ALL) ALL\)/\1/' /etc/sudoers
-    echo "$USERNAME:${USER_PASSWORD:-arch}" | chpasswd
-    echo "root:${ROOT_PASSWORD:-arch}" | chpasswd
+    env USERNAME="$USERNAME" USER_PASSWORD="$USER_PASSWORD" ROOT_PASSWORD="$ROOT_PASSWORD" HOSTNAME="$HOSTNAME" bash -lc '
+        useradd -m -G wheel,audio,video,storage,optical,input -s /bin/zsh "$USERNAME"
+        sed -i "s/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/" /etc/sudoers
+        if ! printf "%s\n%s\n" "$USER_PASSWORD" "$USER_PASSWORD" | chpasswd; then
+            echo "Failed to set user password" >&2
+            exit 1
+        fi
+        if ! printf "%s\n%s\n" "$ROOT_PASSWORD" "$ROOT_PASSWORD" | chpasswd; then
+            echo "Failed to set root password" >&2
+            exit 1
+        fi
+        printf "%s\n" "$HOSTNAME" > /etc/hostname
+    '
 
     sed -i '/^#\[multilib\]/{n;s/^#//};/^#\[multilib\]/s/^#//;' /etc/pacman.conf
     sed -i 's/^#ParallelDownloads/ParallelDownloads/; s/^#Color/Color/' /etc/pacman.conf
@@ -233,7 +278,7 @@ HEOF
     fi
     mkinitcpio -P >>"$LOG_FILE" 2>&1 || _die "mkinitcpio failed"
 
-    bootctl install --path=/boot >>"$LOG_FILE" 2>&1
+    bootctl --esp-path=/boot install >>"$LOG_FILE" 2>&1
     cat > /boot/loader/loader.conf << 'EOF'
 default  arch.conf
 timeout  3
@@ -302,7 +347,9 @@ _restore_backup_in_chroot() {
     BACKUP_ROOT_PATH="$KIRILL_CHROOT/$BACKUP_SUBPATH"
     if [ ! -d "$BACKUP_ROOT_PATH" ]; then
         _log "WARN: путь к бэкапу не найден: $BACKUP_ROOT_PATH"
-        umount "$KIRILL_CHROOT" 2>/dev/null || true
+        if ! umount "$KIRILL_CHROOT" 2>/dev/null; then
+            _log "WARN: не удалось размонтировать $KIRILL_CHROOT"
+        fi
         return 0
     fi
 
@@ -310,7 +357,9 @@ _restore_backup_in_chroot() {
     LATEST=$(find "$BACKUP_ROOT_PATH" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
     if [ -z "$LATEST" ]; then
         _log "WARN: нет бэкапов в $BACKUP_ROOT_PATH"
-        umount "$KIRILL_CHROOT" 2>/dev/null || true
+        if ! umount "$KIRILL_CHROOT" 2>/dev/null; then
+            _log "WARN: не удалось размонтировать $KIRILL_CHROOT"
+        fi
         return 0
     fi
 
@@ -335,8 +384,9 @@ _restore_backup_in_chroot() {
                     autostart autostart-scripts kglobalshortcuts menus; do
             [ -d "$LATEST/kde/config/$dir" ] && {
                 mkdir -p "$HOME_TARGET/.config/$dir"
-                rsync -aAX "$LATEST/kde/config/$dir/" \
-                    "$HOME_TARGET/.config/$dir/" 2>>"$LOG_FILE" || true
+                if ! rsync -aAX "$LATEST/kde/config/$dir/" "$HOME_TARGET/.config/$dir/" 2>>"$LOG_FILE"; then
+                    _log "WARN: не удалось восстановить KDE каталог $dir"
+                fi
             }
         done
     }
@@ -344,15 +394,17 @@ _restore_backup_in_chroot() {
     # ── KDE local (kscreen — критично!) ──────────────────────
     [ -d "$LATEST/kde/local" ] && {
         mkdir -p "$HOME_TARGET/.local/share"
-        rsync -aAX "$LATEST/kde/local/" \
-            "$HOME_TARGET/.local/share/" 2>>"$LOG_FILE" || true
+        if ! rsync -aAX "$LATEST/kde/local/" "$HOME_TARGET/.local/share/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить KDE local данные"
+        fi
     }
 
     # ── kitty ────────────────────────────────────────────────
     [ -d "$LATEST/kitty" ] && {
         mkdir -p "$HOME_TARGET/.config/kitty"
-        rsync -aAX "$LATEST/kitty/" \
-            "$HOME_TARGET/.config/kitty/" 2>>"$LOG_FILE" || true
+        if ! rsync -aAX "$LATEST/kitty/" "$HOME_TARGET/.config/kitty/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить kitty конфиги"
+        fi
     }
 
     # ── fastfetch ────────────────────────────────────────────
@@ -362,57 +414,75 @@ _restore_backup_in_chroot() {
             \( -type f -o \( -type d ! -name "system" \) \) \
             ! -path "$LATEST/fastfetch" | while read -r item; do
             if [ -f "$item" ]; then
-                cp "$item" "$HOME_TARGET/.config/fastfetch/" 2>>"$LOG_FILE" || true
+                if ! cp "$item" "$HOME_TARGET/.config/fastfetch/" 2>>"$LOG_FILE"; then
+                    _log "WARN: не удалось скопировать fastfetch файл $item"
+                fi
             elif [ -d "$item" ]; then
-                rsync -aAX "$item/" \
-                    "$HOME_TARGET/.config/fastfetch/$(basename "$item")/" 2>>"$LOG_FILE" || true
+                if ! rsync -aAX "$item/" "$HOME_TARGET/.config/fastfetch/$(basename "$item")/" 2>>"$LOG_FILE"; then
+                    _log "WARN: не удалось восстановить fastfetch каталог $item"
+                fi
             fi
         done
     }
 
     # ── Shell ─────────────────────────────────────────────────
     for f in .zshrc .zprofile .zshenv; do
-        [ -f "$LATEST/shell/$f" ] && cp "$LATEST/shell/$f" "$HOME_TARGET/" 2>>"$LOG_FILE" || true
+        [ -f "$LATEST/shell/$f" ] && {
+            if ! cp "$LATEST/shell/$f" "$HOME_TARGET/" 2>>"$LOG_FILE"; then
+                _log "WARN: не удалось восстановить shell файл $f"
+            fi
+        }
     done
     [ -d "$LATEST/shell/omz_custom" ] && {
         mkdir -p "$HOME_TARGET/.oh-my-zsh/custom"
-        rsync -aAX "$LATEST/shell/omz_custom/" \
-            "$HOME_TARGET/.oh-my-zsh/custom/" 2>>"$LOG_FILE" || true
+        if ! rsync -aAX "$LATEST/shell/omz_custom/" "$HOME_TARGET/.oh-my-zsh/custom/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить omz custom"
+        fi
     }
 
     # ── GTK ──────────────────────────────────────────────────
     for gtkv in gtk-3.0 gtk-4.0; do
         [ -d "$LATEST/gtk/$gtkv" ] && {
             mkdir -p "$HOME_TARGET/.config/$gtkv"
-            rsync -aAX "$LATEST/gtk/$gtkv/" "$HOME_TARGET/.config/$gtkv/" 2>>"$LOG_FILE" || true
+            if ! rsync -aAX "$LATEST/gtk/$gtkv/" "$HOME_TARGET/.config/$gtkv/" 2>>"$LOG_FILE"; then
+                _log "WARN: не удалось восстановить GTK каталог $gtkv"
+            fi
         }
     done
-    [ -f "$LATEST/gtk/.gtkrc-2.0" ] && cp "$LATEST/gtk/.gtkrc-2.0" "$HOME_TARGET/" 2>>"$LOG_FILE" || true
+    [ -f "$LATEST/gtk/.gtkrc-2.0" ] && {
+        if ! cp "$LATEST/gtk/.gtkrc-2.0" "$HOME_TARGET/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить .gtkrc-2.0"
+        fi
+    }
 
     # ── Шрифты ───────────────────────────────────────────────
     [ -d "$LATEST/fonts/user" ] && {
         mkdir -p "$HOME_TARGET/.local/share/fonts"
-        rsync -aAX "$LATEST/fonts/user/" \
-            "$HOME_TARGET/.local/share/fonts/" 2>>"$LOG_FILE" || true
+        if ! rsync -aAX "$LATEST/fonts/user/" "$HOME_TARGET/.local/share/fonts/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить пользовательские шрифты"
+        fi
     }
     [ -d "$LATEST/fonts/fontconfig" ] && {
         mkdir -p "$HOME_TARGET/.config/fontconfig"
-        rsync -aAX "$LATEST/fonts/fontconfig/" \
-            "$HOME_TARGET/.config/fontconfig/" 2>>"$LOG_FILE" || true
+        if ! rsync -aAX "$LATEST/fonts/fontconfig/" "$HOME_TARGET/.config/fontconfig/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить fontconfig"
+        fi
     }
 
     # ── Приложения ───────────────────────────────────────────
     [ -d "$LATEST/apps/TelegramDesktop" ] && {
         mkdir -p "$HOME_TARGET/.local/share/TelegramDesktop"
-        rsync -aAX "$LATEST/apps/TelegramDesktop/" \
-            "$HOME_TARGET/.local/share/TelegramDesktop/" 2>>"$LOG_FILE" || true
+        if ! rsync -aAX "$LATEST/apps/TelegramDesktop/" "$HOME_TARGET/.local/share/TelegramDesktop/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить TelegramDesktop"
+        fi
     }
     for app_dir in vesktop discord "google-chrome" BraveSoftware \
                    "obsidian-config" "Code" "Code - OSS"; do
         [ -d "$LATEST/apps/$app_dir" ] && {
             mkdir -p "$HOME_TARGET/.config/$app_dir"
-            rsync -aAX "$LATEST/apps/$app_dir/" \
-                "$HOME_TARGET/.config/$app_dir/" 2>>"$LOG_FILE" || true
+            if ! rsync -aAX "$LATEST/apps/$app_dir/" "$HOME_TARGET/.config/$app_dir/" 2>>"$LOG_FILE"; then
+                _log "WARN: не удалось восстановить приложение $app_dir"
+            fi
         }
     done
 
@@ -420,7 +490,9 @@ _restore_backup_in_chroot() {
     if [ -f "$LATEST/apps/ssh_backup.tar.gz.enc" ]; then
         _log "SSH ключи зашифрованы — расшифровка при первом входе пользователя"
         # Кладём зашифрованный архив и скрипт расшифровки
-        cp "$LATEST/apps/ssh_backup.tar.gz.enc" "$HOME_TARGET/" 2>>"$LOG_FILE" || true
+        if ! cp "$LATEST/apps/ssh_backup.tar.gz.enc" "$HOME_TARGET/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось скопировать SSH архив"
+        fi
         cat > "$HOME_TARGET/restore_ssh.sh" << 'SSHSCRIPT'
 #!/usr/bin/env bash
 # Запусти один раз для расшифровки SSH ключей
@@ -436,7 +508,9 @@ SSHSCRIPT
     fi
 
     if [ -f "$LATEST/apps/gnupg_backup.tar.gz.enc" ]; then
-        cp "$LATEST/apps/gnupg_backup.tar.gz.enc" "$HOME_TARGET/" 2>>"$LOG_FILE" || true
+        if ! cp "$LATEST/apps/gnupg_backup.tar.gz.enc" "$HOME_TARGET/" 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось скопировать GPG архив"
+        fi
         cat > "$HOME_TARGET/restore_gpg.sh" << 'GPGSCRIPT'
 #!/usr/bin/env bash
 openssl enc -d -aes-256-cbc -salt -pbkdf2 \
@@ -449,22 +523,33 @@ GPGSCRIPT
     fi
 
     # ── SDDM ─────────────────────────────────────────────────
-    [ -f "$LATEST/sddm/sddm.conf" ] && \
-        cp "$LATEST/sddm/sddm.conf" /etc/ 2>>"$LOG_FILE" || true
+    [ -f "$LATEST/sddm/sddm.conf" ] && {
+        if ! cp "$LATEST/sddm/sddm.conf" /etc/ 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить sddm.conf"
+        fi
+    }
     [ -d "$LATEST/sddm/sddm.conf.d" ] && {
         mkdir -p /etc/sddm.conf.d
-        cp -r "$LATEST/sddm/sddm.conf.d/." /etc/sddm.conf.d/ 2>>"$LOG_FILE" || true
+        if ! cp -r "$LATEST/sddm/sddm.conf.d/." /etc/sddm.conf.d/ 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить sddm.conf.d"
+        fi
     }
     [ -d "$LATEST/sddm/themes" ] && {
         mkdir -p /usr/share/sddm/themes
-        cp -r "$LATEST/sddm/themes/." /usr/share/sddm/themes/ 2>>"$LOG_FILE" || true
-        chmod -R 755 /usr/share/sddm/themes/ 2>>"$LOG_FILE" || true   # права для sddm-пользователя
+        if ! cp -r "$LATEST/sddm/themes/." /usr/share/sddm/themes/ 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось восстановить SDDM темы"
+        fi
+        if ! chmod -R 755 /usr/share/sddm/themes/ 2>>"$LOG_FILE"; then
+            _log "WARN: не удалось выставить права на SDDM темы"
+        fi
     }
 
     # ── Возвращаем права пользователю (КРИТИЧНО) ─────────────
     chown -R "$USERNAME:$USERNAME" "$HOME_TARGET"
 
-    umount "$KIRILL_CHROOT" 2>>"$LOG_FILE" || true
+    if ! umount "$KIRILL_CHROOT" 2>>"$LOG_FILE"; then
+        _log "WARN: не удалось размонтировать $KIRILL_CHROOT"
+    fi
     rm -rf "$KIRILL_CHROOT"
     _log "Восстановление из бэкапа завершено"
 }
@@ -588,7 +673,9 @@ CONFIRM_DST=$(whiptail --title "Финальное подтверждение" \
 # ── Размонтируем разделы ──────────────────────────────────────
 for disk in "$SRC_DISK" "$DST_DISK"; do
     while IFS= read -r part; do
-        umount "/dev/$part" 2>/dev/null || true
+        if ! umount "/dev/$part" 2>/dev/null; then
+            _log "WARN: не удалось размонтировать /dev/$part"
+        fi
     done < <(lsblk -no NAME "$disk" | tail -n +2)
 done
 
@@ -605,7 +692,10 @@ dd if="$SRC_DISK" bs=4M 2>/dev/null | \
     dd of="$DST_DISK" bs=4M conv=noerror,sync 2>/dev/null
 
 sync; sleep 2
-partprobe "$DST_DISK" 2>/dev/null || true; sleep 2
+if ! partprobe "$DST_DISK" 2>/dev/null; then
+    _log "WARN: не удалось выполнить partprobe для $DST_DISK"
+fi
+sleep 2
 
 # ── Новые UUID для клона ──────────────────────────────────────
 whiptail --title "UUID разделов" --yesno \
@@ -636,7 +726,7 @@ if [[ "$MODE" == "live" ]]; then
 
 command -v whiptail &>/dev/null || ensure_runtime_package libnewt
 preflight_checks
-_set_ru_mirrors
+_set_mirrors
 
 whiptail --title "Установка Arch с бэкапом" --msgbox \
 "Пакеты будут взяты из бэкапа (pkglist_repo.txt + pkglist_aur.txt),\nа не из хардкодного списка!\n\nKDE, kitty, fastfetch, сессии — всё восстановится\nавтоматически в chroot до первого входа." \
@@ -645,6 +735,7 @@ whiptail --title "Установка Arch с бэкапом" --msgbox \
 USERNAME=$(_input "Пользователь" "Имя пользователя:" "kirill") || _die "Отменено."
 [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]*$ ]] || _die "Некорректное имя: '$USERNAME'"
 HOSTNAME=$(_input "Hostname" "Имя компьютера:" "archbox") || _die "Отменено."
+validate_hostname "$HOSTNAME"
 
 TARGET_DISK=$(_select_target_disk)
 validate_disk_path "$TARGET_DISK" || _die "Некорректный диск: $TARGET_DISK"
@@ -703,7 +794,9 @@ _log "Бэкап UUID: $BACKUP_UUID, Path: $BACKUP_SUBPATH"
     exec 1>>"$LOG_FILE" 2>&1
 
     _step 2 "Синхронизация времени..."
-    timedatectl set-ntp true || true
+    if ! timedatectl set-ntp true; then
+        _log "WARN: не удалось синхронизировать время через timedatectl"
+    fi
 
     run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT" "$USE_LUKS"
 
@@ -733,6 +826,8 @@ PART_ROOT="$PART_ROOT"
 USE_LUKS="${USE_LUKS:-no}"
 CPU_DRIVER="${CPU_DRIVER:-auto}"
 GPU_DRIVER="${GPU_DRIVER:-auto}"
+TIMEZONE="${TIMEZONE:-Europe/Moscow}"
+ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-8192}"
 BACKUP_UUID="$BACKUP_UUID"
 BACKUP_SUBPATH="$BACKUP_SUBPATH"
 ENVEOF
@@ -748,7 +843,9 @@ ENVEOF
 } | whiptail --title "Установка Arch Linux с бэкапом..." \
     --gauge "Инициализация..." 8 74 0
 
-umount -R /mnt 2>>"$LOG_FILE" || true
+if ! umount -R /mnt 2>>"$LOG_FILE"; then
+    _log "WARN: не удалось размонтировать /mnt"
+fi
 whiptail --title "✓ ЭТАП 1 ЗАВЕРШЁН!" --msgbox \
 "Arch установлен + бэкап восстановлен в chroot!\n
   ✓ Пользователь $USERNAME (пароль: arch — СМЕНИ!)\n  ✓ Конфиги KDE, kitty, fastfetch\n  ✓ Пакеты из pkglist_repo.txt\n  ✓ SDDM, шрифты, GTK\n
@@ -776,20 +873,25 @@ if [[ "$MODE" == "fresh" ]]; then
 
 command -v whiptail &>/dev/null || ensure_runtime_package libnewt
 preflight_checks
-_set_ru_mirrors
+_set_mirrors
 
 whiptail --title "Чистая установка Arch" --msgbox \
 "Arch + KDE Plasma + базовые пакеты.\nБез восстановления конфигов.\n\nКонфиги KDE, kitty, fastfetch — дефолтные.\nВосстановить бэкап можно потом через backup_tui.sh." \
 12 72
 
-USERNAME=$(_input "Пользователь" "Имя пользователя:" "kirill") || _die "Отменено."
+USERNAME=$(_input "Пользователь" "Имя пользователя:" "${USERNAME:-teddy}") || _die "Отменено."
 [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]*$ ]] || _die "Некорректное имя: '$USERNAME'"
-HOSTNAME=$(_input "Hostname" "Имя компьютера:" "archbox") || _die "Отменено."
+HOSTNAME=$(_input "Hostname" "Имя компьютера:" "${HOSTNAME:-archbox}") || _die "Отменено."
+validate_hostname "$HOSTNAME"
 
 TARGET_DISK=$(_select_target_disk)
 validate_disk_path "$TARGET_DISK" || _die "Некорректный диск: $TARGET_DISK"
 IFS='|' read -r PART_EFI PART_ROOT <<< "$(_derive_partition_names "$TARGET_DISK")"
-USE_LUKS=$(ask_luks_enabled)
+if [[ "${USE_LUKS:-no}" == "yes" ]]; then
+    USE_LUKS=yes
+else
+    USE_LUKS=$(ask_luks_enabled)
+fi
 export USE_LUKS
 if [[ "$USE_LUKS" == "yes" ]]; then
     LUKS_PASSWORD=$(ask_luks_password) || _die "Отменено."
@@ -809,7 +911,9 @@ _log "Диск: $TARGET_DISK, Пользователь: $USERNAME, Хост: $HO
     exec 1>>"$LOG_FILE" 2>&1
 
     _step 2 "Синхронизация времени..."
-    timedatectl set-ntp true || true
+    if ! timedatectl set-ntp true; then
+        _log "WARN: не удалось синхронизировать время через timedatectl"
+    fi
 
     run_stage "partitioning" _partition_disk "$TARGET_DISK" "$PART_EFI" "$PART_ROOT" "$USE_LUKS"
 
@@ -839,6 +943,8 @@ PART_ROOT="$PART_ROOT"
 USE_LUKS="${USE_LUKS:-no}"
 CPU_DRIVER="${CPU_DRIVER:-auto}"
 GPU_DRIVER="${GPU_DRIVER:-auto}"
+TIMEZONE="${TIMEZONE:-Europe/Moscow}"
+ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-8192}"
 BACKUP_UUID="Пропустить"
 BACKUP_SUBPATH=""
 ENVEOF
@@ -853,7 +959,9 @@ ENVEOF
 
 } | whiptail --title "Чистая установка..." --gauge "Инициализация..." 8 74 0
 
-umount -R /mnt 2>>"$LOG_FILE" || true
+if ! umount -R /mnt 2>>"$LOG_FILE"; then
+    _log "WARN: не удалось размонтировать /mnt"
+fi
 whiptail --title "✓ ЧИСТАЯ УСТАНОВКА ЗАВЕРШЕНА!" --msgbox \
 "Arch установлен!\n  ✓ Пользователь $USERNAME (пароль: arch — СМЕНИ!)\n  ✓ btrfs + linux + linux-lts\n  ✓ NetworkManager\n\nСледующие шаги:\n  1. Вытащи флешку\n  2. Нажми OK — перезагрузка\n  3. bash ~/install_tui.sh --post" \
 18 72
@@ -885,16 +993,26 @@ fi
 
 [ "$(id -u)" -eq 0 ] && _die "Запускай от обычного пользователя!"
 sudo -v || _die "Нужны права sudo для продолжения!"
-while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+while kill -0 "$$" 2>/dev/null; do
+    if ! sudo -n true >/dev/null 2>&1; then
+        _log "WARN: sudo keepalive stopped"
+        break
+    fi
+    sleep 55
+done 2>/dev/null &
 SUDO_KEEP_PID=$!
-[ -f ~/install_vars.env ] && source ~/install_vars.env || true
+if [[ -f ~/install_vars.env ]]; then
+    if ! source ~/install_vars.env; then
+        _log "WARN: не удалось загрузить ~/install_vars.env"
+    fi
+fi
 USERNAME=$(whoami)
 IS_BACKUP_INSTALL=false
 [ -f "$HOME/.config/kdeglobals" ] && IS_BACKUP_INSTALL=true  # конфиги уже есть — это установка с бэкапом
 
 whiptail --title "Этап 2 — Настройка" --msgbox \
 "Сейчас установятся:\n
-  • NVIDIA RTX 3050 драйверы\n  • KDE Plasma 6 + Wayland + SDDM
+  • драйверы GPU ($GPU_DRIVER)\n  • KDE Plasma 6 + Wayland + SDDM
   • kitty, fastfetch\n  • paru (AUR-хелпер)\n
 $(if $IS_BACKUP_INSTALL; then
     echo "  • AUR пакеты из бэкапа (pkglist_aur.txt)\n  • Разработка, игры, AI"
@@ -924,19 +1042,18 @@ fi)\n
         cd ~ && rm -rf /tmp/paru_b
     fi
 
-_step 12 "NVIDIA RTX 3050..."
-sudo pacman -S --needed --noconfirm \
-    nvidia nvidia-utils nvidia-settings \
-    lib32-nvidia-utils lib32-opencl-nvidia \
-    opencl-nvidia libva-nvidia-driver >>"$LOG_FILE" 2>&1
-
-sudo sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' \
-    /etc/mkinitcpio.conf
-sudo sed -i 's/ kms//' /etc/mkinitcpio.conf
-sudo mkinitcpio -P >>"$LOG_FILE" 2>&1
-
-sudo mkdir -p /etc/pacman.d/hooks
-sudo tee /etc/pacman.d/hooks/nvidia.hook > /dev/null << 'HOOK'
+_step 12 "GPU драйверы..."
+case "${GPU_DRIVER:-auto}" in
+    nvidia-dkms)
+        sudo pacman -S --needed --noconfirm \
+            nvidia nvidia-utils nvidia-settings \
+            lib32-nvidia-utils lib32-opencl-nvidia \
+            opencl-nvidia libva-nvidia-driver >>"$LOG_FILE" 2>&1
+        sudo sed -i 's/^MODULES=.*/MODULES=(nvidia nvidia_modeset nvidia_uvm nvidia_drm)/' /etc/mkinitcpio.conf
+        sudo sed -i 's/ kms//' /etc/mkinitcpio.conf
+        sudo mkinitcpio -P >>"$LOG_FILE" 2>&1
+        sudo mkdir -p /etc/pacman.d/hooks
+        sudo tee /etc/pacman.d/hooks/nvidia.hook > /dev/null << 'HOOK'
 [Trigger]
 Operation=Install
 Operation=Upgrade
@@ -951,10 +1068,21 @@ When=PostTransaction
 NeedsTargets
 Exec=/bin/sh -c 'while read -r trg; do case $trg in linux) exit 0; esac; done; /usr/bin/mkinitcpio -P'
 HOOK
-sudo tee /etc/modprobe.d/nvidia.conf > /dev/null << 'NVCFG'
+        sudo tee /etc/modprobe.d/nvidia.conf > /dev/null << 'NVCFG'
 options nvidia_drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 NVCFG
+        ;;
+    amdgpu)
+        sudo pacman -S --needed --noconfirm mesa libva-mesa-driver vulkan-radeon >>"$LOG_FILE" 2>&1
+        ;;
+    intel-media-driver)
+        sudo pacman -S --needed --noconfirm intel-media-driver >>"$LOG_FILE" 2>&1
+        ;;
+    *)
+        _log "GPU driver ${GPU_DRIVER:-auto}: skipping GPU-specific packages"
+        ;;
+esac
 
 _step 22 "KDE Plasma 6 + Wayland..."
 sudo pacman -S --needed --noconfirm \
@@ -967,8 +1095,8 @@ _step 30 "PipeWire + Bluetooth..."
 sudo pacman -S --needed --noconfirm \
     pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber qpwgraph \
     bluez bluez-utils bluedevil >>"$LOG_FILE" 2>&1
-systemctl --user enable --now pipewire pipewire-pulse wireplumber >>"$LOG_FILE" 2>&1 || true
-sudo systemctl enable --now bluetooth >>"$LOG_FILE" 2>&1
+_run_optional "pipewire user services" systemctl --user enable --now pipewire pipewire-pulse wireplumber >>"$LOG_FILE" 2>&1
+_run_optional "bluetooth service" sudo systemctl enable --now bluetooth >>"$LOG_FILE" 2>&1
 
 _step 34 "kitty + fastfetch + шрифты..."
 sudo pacman -S --needed --noconfirm \
@@ -976,7 +1104,7 @@ sudo pacman -S --needed --noconfirm \
     noto-fonts noto-fonts-cjk noto-fonts-emoji \
     ttf-liberation ttf-dejavu ttf-jetbrains-mono-nerd \
     >>"$LOG_FILE" 2>&1
-sudo systemctl enable sddm >>"$LOG_FILE" 2>&1
+_run_optional "sddm service" sudo systemctl enable sddm >>"$LOG_FILE" 2>&1
 
 } | whiptail --title "Базовые пакеты..." --gauge "Инициализация..." 8 74 0
 
@@ -1031,7 +1159,7 @@ echo "# Диски Teddy — добавлено install_tui.sh"
         "$(sudo blkid -s UUID -o value "$CHOICE_K" 2>/dev/null || echo "")"
 } | sudo tee -a /etc/fstab > /dev/null
 
-sudo mount -a 2>>"$LOG_FILE" || true
+_run_optional "mount data partitions" sudo mount -a 2>>"$LOG_FILE"
 
 {
 # ── AUR пакеты: из бэкапа ИЛИ хардкод ────────────────────────
@@ -1040,8 +1168,8 @@ KBR="/mnt/kirill/установочные файлы/linux/kde_backup"
 AUR_FROM_BACKUP=false
 
 if [ -d "$KBR" ]; then
-    LATEST_BK=$(find "$KBR" -maxdepth 1 -mindepth 1 -type d | sort -r | head -1)
-    if [ -f "$LATEST_BK/packages/pkglist_aur.txt" ]; then
+    LATEST_BK=$(find "$KBR" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+    if [ -n "$LATEST_BK" ] && [ -f "$LATEST_BK/packages/pkglist_aur.txt" ]; then
         _log "AUR: устанавливаем из бэкапа..."
         paru -S --needed --noconfirm - < "$LATEST_BK/packages/pkglist_aur.txt" \
             >>"$LOG_FILE" 2>&1 || _log "WARN: часть AUR пакетов не установилась"
@@ -1051,13 +1179,13 @@ fi
 
 if ! $AUR_FROM_BACKUP; then
     _log "AUR: бэкап не найден — базовый хардкод"
-    paru -S --needed --noconfirm \
+    _run_optional "AUR base packages" paru -S --needed --noconfirm \
         telegram-desktop vesktop \
         visual-studio-code-bin \
         google-chrome ttf-ms-fonts \
         heroic-games-launcher-bin \
         lmstudio-bin claude-desktop-bin \
-        2>>"$LOG_FILE" || true
+        2>>"$LOG_FILE"
 fi
 
 # ── Разработка (только при чистой установке) ──────────────────
@@ -1067,9 +1195,14 @@ if ! $IS_BACKUP_INSTALL; then
         python python-pip python-virtualenv pyenv \
         docker docker-compose \
         android-tools android-udev >>"$LOG_FILE" 2>&1
-    paru -S --needed --noconfirm nvm 2>>"$LOG_FILE" || true
-    curl -fsSL https://bun.sh/install | bash >>"$LOG_FILE" 2>&1 || true
-    sudo systemctl enable --now docker >>"$LOG_FILE" 2>&1
+    _run_optional "nvm install" paru -S --needed --noconfirm nvm 2>>"$LOG_FILE"
+    if ! command -v bun >/dev/null 2>&1; then
+        tmp_bun="$(mktemp /tmp/bun-install.XXXXXX.sh)"
+        _run_optional "bun install" curl -fsSL https://bun.sh/install -o "$tmp_bun" >>"$LOG_FILE" 2>&1
+        _run_optional "bun setup" bash "$tmp_bun" >>"$LOG_FILE" 2>&1
+        rm -f "$tmp_bun"
+    fi
+    _run_optional "docker service" sudo systemctl enable --now docker >>"$LOG_FILE" 2>&1
     sudo usermod -aG docker "$USERNAME"
 
     # ── Игры ──────────────────────────────────────────────────
@@ -1084,19 +1217,21 @@ if ! $IS_BACKUP_INSTALL; then
     _step 68 "Ollama..."
     sudo pacman -S --needed --noconfirm ollama-cuda 2>>"$LOG_FILE" || \
         sudo pacman -S --needed --noconfirm ollama >>"$LOG_FILE" 2>&1
-    sudo systemctl enable --now ollama >>"$LOG_FILE" 2>&1
+    _run_optional "ollama service" sudo systemctl enable --now ollama >>"$LOG_FILE" 2>&1
 fi
 
 # ── Оптимизации (всегда) ──────────────────────────────────────
-_step 78 "zram: 8ГБ..."
+_step 78 "zram..."
+zram_size="${ZRAM_SIZE_MB:-8192}"
+[[ "$zram_size" =~ ^[0-9]+$ ]] || zram_size=8192
 sudo pacman -S --needed --noconfirm zram-generator >>"$LOG_FILE" 2>&1
-sudo tee /etc/systemd/zram-generator.conf > /dev/null << 'ZRAM'
+sudo tee /etc/systemd/zram-generator.conf > /dev/null << ZRAM
 [zram0]
-zram-size = 8192
+zram-size = ${zram_size}
 compression-algorithm = zstd
 ZRAM
 sudo systemctl daemon-reload
-sudo systemctl start systemd-zram-setup@zram0.service 2>>"$LOG_FILE" || true
+_run_optional "zram setup service" sudo systemctl start systemd-zram-setup@zram0.service 2>>"$LOG_FILE"
 
 _step 82 "IO scheduler + power-profiles..."
 sudo tee /etc/udev/rules.d/60-io-scheduler.rules > /dev/null << 'UDEV'
@@ -1104,27 +1239,27 @@ ACTION=="add|change", KERNEL=="nvme*", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="sd*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
 UDEV
 sudo pacman -S --needed --noconfirm power-profiles-daemon >>"$LOG_FILE" 2>&1
-sudo systemctl enable --now power-profiles-daemon >>"$LOG_FILE" 2>&1
-powerprofilesctl set performance 2>>"$LOG_FILE" || true
+_run_optional "power-profiles-daemon" sudo systemctl enable --now power-profiles-daemon >>"$LOG_FILE" 2>&1
+_run_optional "powerprofilesctl performance" powerprofilesctl set performance 2>>"$LOG_FILE"
 
 _step 86 "Snapper..."
 sudo pacman -S --needed --noconfirm snapper snap-pac >>"$LOG_FILE" 2>&1
-sudo snapper -c root create-config / 2>>"$LOG_FILE" || true
-sudo sed -i \
+_run_optional "snapper config" sudo snapper -c root create-config / 2>>"$LOG_FILE"
+_run_optional "snapper tuning" sudo sed -i \
     -e 's/^TIMELINE_LIMIT_HOURLY=.*/TIMELINE_LIMIT_HOURLY="5"/' \
     -e 's/^TIMELINE_LIMIT_DAILY=.*/TIMELINE_LIMIT_DAILY="7"/' \
     -e 's/^TIMELINE_LIMIT_WEEKLY=.*/TIMELINE_LIMIT_WEEKLY="0"/' \
     -e 's/^TIMELINE_LIMIT_MONTHLY=.*/TIMELINE_LIMIT_MONTHLY="0"/' \
     -e 's/^TIMELINE_LIMIT_YEARLY=.*/TIMELINE_LIMIT_YEARLY="0"/' \
-    /etc/snapper/configs/root 2>>"$LOG_FILE" || true
-sudo systemctl enable --now snapper-timeline.timer snapper-cleanup.timer >>"$LOG_FILE" 2>&1
+    /etc/snapper/configs/root 2>>"$LOG_FILE"
+_run_optional "snapper timers" sudo systemctl enable --now snapper-timeline.timer snapper-cleanup.timer >>"$LOG_FILE" 2>&1
 
 _step 90 "ufw + paccache..."
 sudo pacman -S --needed --noconfirm ufw pacman-contrib >>"$LOG_FILE" 2>&1
-sudo ufw default deny incoming >>"$LOG_FILE" 2>&1
-sudo ufw default allow outgoing >>"$LOG_FILE" 2>&1
-sudo systemctl enable --now ufw >>"$LOG_FILE" 2>&1
-sudo systemctl enable --now paccache.timer >>"$LOG_FILE" 2>&1
+_run_optional "ufw default deny" sudo ufw default deny incoming >>"$LOG_FILE" 2>&1
+_run_optional "ufw default allow" sudo ufw default allow outgoing >>"$LOG_FILE" 2>&1
+_run_optional "ufw service" sudo systemctl enable --now ufw >>"$LOG_FILE" 2>&1
+_run_optional "paccache timer" sudo systemctl enable --now paccache.timer >>"$LOG_FILE" 2>&1
 
 _step 100 "Готово!"
 sleep 1

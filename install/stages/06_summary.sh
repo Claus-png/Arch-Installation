@@ -5,5 +5,5 @@ stage_06_summary() {
     [[ "${USE_LUKS:-no}" == "yes" ]] && luks_flag="yes"
 
     whiptail --title "Финальный обзор" --yesno \
-"Диск: ${DISK:-unknown}\nПользователь: ${USERNAME:-unknown}\nХост: ${HOSTNAME:-unknown}\nLUKS: ${luks_flag}\nПакеты: ${SELECTED_PACKAGES:-базовый набор}\n\nБэкап: восстанавливается отдельно через backup_tui.sh\n\nНачать установку?" 18 74
+"Диск: ${DISK:-unknown}\nПользователь: ${USERNAME:-unknown}\nХост: ${HOSTNAME:-unknown}\nLUKS: ${luks_flag}\nCPU: ${CPU_DRIVER:-auto}\nGPU: ${GPU_DRIVER:-auto}\nПакеты: ${SELECTED_PACKAGES:-базовый набор}\n\nБэкап: восстанавливается отдельно через backup_tui.sh\n\nНачать установку?" 18 74
 }

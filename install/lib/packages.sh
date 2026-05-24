@@ -13,7 +13,7 @@ CATEGORIES=(
 select_packages() {
     local category
     local -a package_items=()
-    local selected_packages=""
+    local -a selected_packages=()
 
     for category in "${CATEGORIES[@]}"; do
         IFS=':' read -r group_name group_packages <<< "$category"
@@ -30,11 +30,13 @@ select_packages() {
             3>&1 1>&2 2>&3) || return 1
 
         if [[ -n "$choice" ]]; then
-            for pkg in $choice; do
-                selected_packages+="$pkg "
-            done
+            while IFS= read -r pkg; do
+                [[ -n "$pkg" ]] || continue
+                pkg=${pkg//\"/}
+                selected_packages+=("$pkg")
+            done < <(printf '%s\n' "$choice" | tr ' ' '\n')
         fi
     done
 
-    printf '%s' "$selected_packages"
+    printf '%s ' "${selected_packages[@]}"
 }

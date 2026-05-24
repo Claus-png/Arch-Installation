@@ -46,15 +46,18 @@ run_stage() {
     fi
     if [[ "$DRY_RUN" == "1" ]]; then
         _log "[dry-run] stage ${stage}: $*"
+        stage_done "$stage"
         return 0
     fi
-    if "$@"; then
+    "$@"
+    local code=$?
+    if [[ "$code" -eq 0 ]]; then
         stage_done "$stage"
         _log "Stage ${stage}: complete"
         return 0
     fi
-    _log "Stage ${stage}: failed"
-    return 1
+    _log "Stage ${stage}: failed with exit ${code}"
+    return "$code"
 }
 
 run_step() {
@@ -98,15 +101,16 @@ load_profile() {
 apply_defaults() {
     export USERNAME="${USERNAME:-${DEFAULT_USERNAME:-teddy}}"
     export HOSTNAME="${HOSTNAME:-${DEFAULT_HOSTNAME:-archbox}}"
+    export TIMEZONE="${TIMEZONE:-${DEFAULT_TIMEZONE:-Europe/Moscow}}"
     export USE_LUKS="${USE_LUKS:-${DEFAULT_USE_LUKS:-no}}"
     export DISK="${DISK:-}"
     export CPU_DRIVER="${CPU_DRIVER:-${DEFAULT_CPU_DRIVER:-auto}}"
     export GPU_DRIVER="${GPU_DRIVER:-${DEFAULT_GPU_DRIVER:-auto}}"
-    export ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-0}"
+    export ZRAM_SIZE_MB="${ZRAM_SIZE_MB:-${DEFAULT_ZRAM_SIZE_MB:-0}}"
     export PACKAGE_LIST="${PACKAGE_LIST:-${DEFAULT_PACKAGE_LIST:-}}"
     export LUKS_PASSWORD="${LUKS_PASSWORD:-}"
-    export USER_PASSWORD="${USER_PASSWORD:-${DEFAULT_USER_PASSWORD:-arch}}"
-    export ROOT_PASSWORD="${ROOT_PASSWORD:-${DEFAULT_ROOT_PASSWORD:-arch}}"
+    export USER_PASSWORD="${USER_PASSWORD:-${DEFAULT_USER_PASSWORD:-}}"
+    export ROOT_PASSWORD="${ROOT_PASSWORD:-${DEFAULT_ROOT_PASSWORD:-}}"
 }
 
 _detect_cpu() {
@@ -121,7 +125,9 @@ _detect_cpu() {
 
 _detect_gpu() {
     local vendor
-    vendor=$(lspci 2>/dev/null | awk '/VGA|3D/ {print $0}' | head -1 || true)
+    if ! vendor=$(lspci 2>/dev/null | awk '/VGA|3D/ {print $0}' | head -1); then
+        vendor=""
+    fi
     if echo "$vendor" | grep -qi "NVIDIA"; then
         GPU_DRIVER="nvidia-dkms"
     elif echo "$vendor" | grep -qi "AMD"; then
@@ -143,24 +149,35 @@ detect_hardware() {
     _log "Hardware detected: CPU=$CPU_DRIVER GPU=$GPU_DRIVER ZRAM=${ZRAM_SIZE_MB}MiB"
 }
 
+validate_hostname() {
+    local hostname="$1"
+    [[ "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || _die "Некорректный hostname: $hostname"
+}
+
 _retry_or_die() {
     local desc="$1"
     shift
-    "$@"
-    local code=$?
-    if [[ "$code" -ne 0 ]]; then
-        if whiptail --yesno "Error: ${desc}\n\nExit code: ${code}\n\nRetry?" 10 60 3>&1 1>&2 2>&3; then
-            _retry_or_die "$desc" "$@"
-        else
-            _log "WARN: step skipped: ${desc}"
-            return "$code"
+
+    while true; do
+        "$@"
+        local code=$?
+        if [[ "$code" -eq 0 ]]; then
+            return 0
         fi
-    fi
-    return 0
+
+        if whiptail --yesno "Error: ${desc}\n\nExit code: ${code}\n\nRetry?" 10 60 3>&1 1>&2 2>&3; then
+            continue
+        fi
+
+        _log "WARN: step skipped: ${desc}"
+        return "$code"
+    done
 }
 
 _try() {
-    _retry_or_die "$1" "$@"
+    local desc="$1"
+    shift
+    _retry_or_die "$desc" "$@"
 }
 
 run_cmd() {
@@ -184,10 +201,12 @@ configure_mkinitcpio() {
         if grep -q 'encrypt' "$mkinitcpio_conf"; then
             :
         elif grep -q '^HOOKS=' "$mkinitcpio_conf"; then
-            sed -i -E 's/^HOOKS=\(([^)]*)block([^)]*)\)/HOOKS=(\1block encrypt\2)/' "$mkinitcpio_conf"
-            if ! grep -q 'encrypt' "$mkinitcpio_conf"; then
+            if grep -q '\<block\>' "$mkinitcpio_conf"; then
+                sed -i 's/\<block\>/block encrypt/' "$mkinitcpio_conf"
+            else
                 sed -i -E 's/^HOOKS=\((.*)\)$/HOOKS=(\1 block encrypt)/' "$mkinitcpio_conf"
             fi
+            grep -q 'encrypt' "$mkinitcpio_conf" || _die "Не удалось добавить encrypt в mkinitcpio.conf"
         fi
     fi
 
@@ -199,7 +218,7 @@ configure_mkinitcpio() {
         fi
     fi
 
-    arch-chroot "$target_root" mkinitcpio -P >> "$LOG_FILE" 2>&1
+    arch-chroot "$target_root" mkinitcpio -P >> "$LOG_FILE" 2>&1 || _die "Не удалось обновить initramfs"
 }
 
 configure_zram() {
@@ -210,11 +229,6 @@ configure_zram() {
 zram-size = ${ZRAM_SIZE_MB}
 compression-algorithm = zstd
 EOF
-}
-
-validate_disk_path() {
-    local disk="$1"
-    [[ "$disk" =~ ^/dev/(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|mmcblk[0-9]+)$ ]]
 }
 
 validate_backup_device() {
@@ -229,12 +243,26 @@ stage_text() {
     printf 'Stage %s of %s: %s' "$current" "$total" "$msg"
 }
 
+_check_deps() {
+    local missing=()
+    local cmd
+
+    for cmd in whiptail sgdisk wipefs partprobe mkfs.btrfs mkfs.fat arch-chroot genfstab bootctl blkid lspci udevadm curl mountpoint pacman cryptsetup mkinitcpio sudo git findmnt pv tune2fs btrfstune; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        _die "Отсутствуют зависимости: ${missing[*]}"
+    fi
+}
+
 preflight_checks() {
     if [[ "$DRY_RUN" == "1" ]]; then
         _log "[dry-run] preflight checks skipped"
         return 0
     fi
 
+    _check_deps
     [ -d /sys/firmware/efi/efivars ] || _die "BIOS-режим! Нужен UEFI."
     timedatectl set-ntp true >> "$LOG_FILE" 2>&1 || _die "Не удалось синхронизировать время"
     curl -fsSL --max-time 5 https://archlinux.org >/dev/null 2>&1 || _die "Нет интернет-соединения"

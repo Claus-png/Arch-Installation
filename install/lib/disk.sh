@@ -16,11 +16,22 @@ _derive_partition_names() {
     fi
 }
 
+_format_luks() {
+    local partition="$1"
+    printf '%s' "$LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 "$partition" -
+}
+
+_open_luks() {
+    local partition="$1"
+    printf '%s' "$LUKS_PASSWORD" | cryptsetup open "$partition" cryptroot
+}
+
 _partition_disk() {
     local disk="$1"
     local part_efi="$2"
     local part_root="$3"
     local use_luks="${4:-no}"
+    local target_btrfs
 
     validate_disk_path "$disk" || _die "Некорректный диск: $disk"
 
@@ -29,20 +40,26 @@ _partition_disk() {
         return 0
     fi
 
-    umount -q -R /mnt 2>/dev/null || true
+    if ! umount -q -R /mnt 2>/dev/null; then
+        _log "WARN: не удалось размонтировать /mnt перед разметкой"
+    fi
     while IFS= read -r p; do
         [[ -n "$p" ]] || continue
-        umount -q -f "/dev/$p" 2>/dev/null || true
+        if ! umount -q -f "/dev/$p" 2>/dev/null; then
+            _log "WARN: не удалось размонтировать /dev/$p"
+        fi
     done < <(lsblk -rno NAME "$disk" 2>/dev/null | tail -n +2)
 
-    run_cmd "disable swap" swapoff -a
+    if ! swapoff -a 2>/dev/null; then
+        _log "WARN: не удалось отключить swap"
+    fi
     run_cmd "wipe filesystem metadata" wipefs -af "$disk"
     run_cmd "zap GPT" sgdisk --zap-all "$disk"
     run_cmd "create EFI partition" sgdisk -n 1:0:+1G -t 1:EF00 -c 1:"EFI System" "$disk"
     run_cmd "create root partition" sgdisk -n 2:0:0 -t 2:8300 -c 2:"Linux btrfs" "$disk"
-    run_cmd "settle udev" udevadm settle
+    run_cmd "settle udev" udevadm settle --timeout=30
     run_cmd "probe partitions" partprobe "$disk"
-    sleep 2
+    run_cmd "settle after probe" udevadm settle --timeout=30
 
     [[ -b "$part_efi" ]] || _die "EFI partition not created: $part_efi"
     [[ -b "$part_root" ]] || _die "Root partition not created: $part_root"
@@ -50,17 +67,18 @@ _partition_disk() {
     run_cmd "format EFI" mkfs.fat -F32 -n EFI "$part_efi"
 
     if [[ "$use_luks" == "yes" ]]; then
-        run_cmd "format LUKS" printf '%s' "$LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 "$part_root" -
-        run_cmd "open LUKS" printf '%s' "$LUKS_PASSWORD" | cryptsetup open "$part_root" cryptroot
-        TARGET_BTRFS="/dev/mapper/cryptroot"
+        run_cmd "format LUKS" _format_luks "$part_root"
+        run_cmd "open LUKS" _open_luks "$part_root"
+        target_btrfs="/dev/mapper/cryptroot"
     else
-        TARGET_BTRFS="$part_root"
+        target_btrfs="$part_root"
     fi
 
-    run_cmd "format root" mkfs.btrfs -L ARCH -f "$TARGET_BTRFS"
+    export TARGET_BTRFS="$target_btrfs"
+    run_cmd "format root" mkfs.btrfs -L ARCH -f "$target_btrfs"
 
     local BOPTS="noatime,compress=zstd:3,space_cache=v2,discard=async"
-    run_cmd "mount root for subvolumes" mount "$TARGET_BTRFS" /mnt
+    run_cmd "mount root for subvolumes" mount "$target_btrfs" /mnt
     run_cmd "create @ subvolume" btrfs subvolume create "/mnt/@"
     run_cmd "create @home subvolume" btrfs subvolume create "/mnt/@home"
     run_cmd "create @log subvolume" btrfs subvolume create "/mnt/@log"
@@ -68,15 +86,15 @@ _partition_disk() {
     run_cmd "create @snapshots subvolume" btrfs subvolume create "/mnt/@snapshots"
     run_cmd "unmount root" umount -R /mnt
 
-    run_cmd "mount root subvolume" mount -o "${BOPTS},subvol=@" "$TARGET_BTRFS" /mnt
+    run_cmd "mount root subvolume" mount -o "${BOPTS},subvol=@" "$target_btrfs" /mnt
     run_cmd "prepare mount points" mkdir -p /mnt/{boot,home,var/log,var/cache,snapshots}
-    run_cmd "mount home subvolume" mount -o "${BOPTS},subvol=@home" "$TARGET_BTRFS" /mnt/home
-    run_cmd "mount log subvolume" mount -o "${BOPTS},subvol=@log" "$TARGET_BTRFS" /mnt/var/log
-    run_cmd "mount cache subvolume" mount -o "${BOPTS},subvol=@cache" "$TARGET_BTRFS" /mnt/var/cache
-    run_cmd "mount snapshots subvolume" mount -o "${BOPTS},subvol=@snapshots" "$TARGET_BTRFS" /mnt/snapshots
+    run_cmd "mount home subvolume" mount -o "${BOPTS},subvol=@home" "$target_btrfs" /mnt/home
+    run_cmd "mount log subvolume" mount -o "${BOPTS},subvol=@log" "$target_btrfs" /mnt/var/log
+    run_cmd "mount cache subvolume" mount -o "${BOPTS},subvol=@cache" "$target_btrfs" /mnt/var/cache
+    run_cmd "mount snapshots subvolume" mount -o "${BOPTS},subvol=@snapshots" "$target_btrfs" /mnt/snapshots
     run_cmd "mount EFI" mount "$part_efi" /mnt/boot
 
-    export TARGET_BTRFS PART_EFI="$part_efi" PART_ROOT="$part_root"
+    export PART_EFI="$part_efi" PART_ROOT="$part_root"
     ROOT_UUID=$(blkid -s UUID -o value "$part_root")
     export ROOT_UUID
     stage_done "disk_done"
@@ -84,7 +102,9 @@ _partition_disk() {
 
 _select_target_disk() {
     local BOOTMNT_DEV
-    BOOTMNT_DEV=$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null || true)
+    if ! BOOTMNT_DEV=$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null); then
+        BOOTMNT_DEV=""
+    fi
 
     local LIVE_DISK=""
     [[ -n "$BOOTMNT_DEV" ]] && LIVE_DISK=$(lsblk -no PKNAME "$BOOTMNT_DEV" 2>/dev/null || echo "")
@@ -99,6 +119,10 @@ _select_target_disk() {
         [[ "/dev/$NAME" == "$LIVE_DISK" ]] && continue
         DISK_LIST+=("/dev/$NAME" "${SIZE} — ${MODEL:-без модели}")
     done < <(lsblk -dno NAME,SIZE,MODEL | grep -v loop)
+
+    if [[ ${#DISK_LIST[@]} -eq 0 ]]; then
+        _die "Не найдено доступных дисков для установки.\nВозможно, все диски заняты Live-USB."
+    fi
 
     local CHOSEN
     CHOSEN=$(whiptail --title "⚠  Выбор диска для УСТАНОВКИ  ⚠" \
@@ -137,7 +161,7 @@ _select_target_disk() {
 }
 
 ask_luks_enabled() {
-    if whiptail --yesno "Enable LUKS encryption for this install?" 8 60 3>&1 1>&2 2>&3; then
+    if whiptail --yesno "Enable LUKS encryption for this install?" 8 60; then
         echo "yes"
     else
         echo "no"

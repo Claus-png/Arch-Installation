@@ -2,7 +2,7 @@
 
 stage_05_packages() {
     if [[ -n "${PACKAGE_LIST:-}" ]]; then
-        SELECTED_PACKAGES="$PACKAGE_LIST"
+        SELECTED_PACKAGES=$(printf '%s' "$PACKAGE_LIST" | tr ',' ' ' | xargs)
         export SELECTED_PACKAGES
         return 0
     fi
